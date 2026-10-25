@@ -82,6 +82,10 @@ class DINOConfig:
     # raises if the frame is inconsistent. Gated by
     # scripts/validate/ocean_fidelity/dino_1226/nemo_dino_mesh_gate.py.
     nemo_faithful_grid: bool = False
+    # Which NEMO DINO mesh nemo_faithful_grid builds: a key of
+    # nemo_dino_mesh.NEMO_DINO_NAMELISTS ("R1" = 1 deg 52x199, "R4" = 1/4 deg
+    # 202x797). Not read off that path.
+    nemo_resolution: str = "R1"
     channel_lat_south_deg: float = -65.0  # southern edge of re-entrant channel
     channel_lat_north_deg: float = -45.0  # northern edge of re-entrant channel
     channel_width_deg: float = 20.0       # Δφ_c in eq A4 (= |lat_n - lat_s|)
@@ -2780,7 +2784,7 @@ def dino_lat_lon_vertical(grid, cfg: DINOConfig | None = None):
                 "nemo_faithful_grid=True builds a masked full-step staircase "
                 f"and needs vertical_coordinate='masked_zco'; got "
                 f"{cfg.vertical_coordinate!r}.")
-        return nemo_faithful_dino_domain().z_coord
+        return nemo_faithful_dino_domain(cfg.nemo_resolution).z_coord
     z_ref = create_dino_z_star(cfg)
     if cfg.vertical_coordinate == "zstar":
         return z_ref
@@ -2939,10 +2943,14 @@ def dino_mpas_initial_state_arrays(
 # halos.  Every certified DINO twin has run on the true frame (via the bridged
 # mesh); only this standalone path had not, so a standalone run and a twin run
 # were not the same experiment.
-_NEMO_DINO_NLON = 52
-_NEMO_DINO_NLAT = 199
-_NEMO_DINO_LON_WEST = 0.0    # westernmost U-face = zgr_get_boundaries pminlam
-_NEMO_DINO_LON_EAST = 51.0   # easternmost  U-face = zgr_get_boundaries pmaxlam
+@_lru_cache(maxsize=4)
+def _nemo_dino_frame(resolution: str):
+    """(west, east) basin walls: the extreme U-face longitudes, which are
+    zgr_get_boundaries' pminlam/pmaxlam.  R1 = (0, 51), R4 = (0, 50.25)."""
+    from legoesm.ocean.fidelity.nemo_dino_mesh import (
+        nemo_dino_hgr, nemo_dino_namelist)
+    lam_u = nemo_dino_hgr(nemo_dino_namelist(resolution))["lam_u"]
+    return float(min(lam_u)), float(max(lam_u))
 
 
 def nemo_faithful_dino_config(base: DINOConfig | None = None) -> DINOConfig:
@@ -2961,12 +2969,13 @@ def nemo_faithful_dino_config(base: DINOConfig | None = None) -> DINOConfig:
     """
     import dataclasses
     base = base if base is not None else DINOConfig()
+    lon_west, lon_east = _nemo_dino_frame(base.nemo_resolution)
     return dataclasses.replace(
         base,
         nemo_faithful_grid=True,
-        lon_west_deg=_NEMO_DINO_LON_WEST,
-        lon_east_deg=_NEMO_DINO_LON_EAST,
-        sill_lon_m_deg=_NEMO_DINO_LON_WEST,
+        lon_west_deg=lon_west,
+        lon_east_deg=lon_east,
+        sill_lon_m_deg=lon_west,
         vertical_coordinate="masked_zco",
         # NEMO's OWN planet.  A bare DINOConfig carries legoesm.constants.Omega,
         # a four-significant-figure rounding 1.58e-05 relative away, and the
@@ -2981,7 +2990,7 @@ def nemo_faithful_dino_config(base: DINOConfig | None = None) -> DINOConfig:
     )
 
 
-def nemo_faithful_dino_domain():
+def nemo_faithful_dino_domain(resolution: str = "R1"):
     """See :func:`_nemo_faithful_dino_domain`; keyed on the precision policy.
 
     The cache MUST be keyed on the storage dtype: the bridge builds its arrays
@@ -2990,11 +2999,11 @@ def nemo_faithful_dino_domain():
     fp64 (or the reverse) -- silently, and with the two never comparable.
     """
     from legoesm.core.precision import get_policy
-    return _nemo_faithful_dino_domain(get_policy().storage)
+    return _nemo_faithful_dino_domain(get_policy().storage, resolution)
 
 
 @_lru_cache(maxsize=4)
-def _nemo_faithful_dino_domain(_storage_dtype):
+def _nemo_faithful_dino_domain(_storage_dtype, resolution):
     """NEMO's DINO domain (geometry, vertical coordinate, land mask), analytic.
 
     Builds NEMO's mesh from its own namelist with
@@ -3020,7 +3029,8 @@ def _nemo_faithful_dino_domain(_storage_dtype):
         ``.land_mask`` (NEMO's surface ``tmask``).
     """
     import numpy as _np
-    from legoesm.ocean.fidelity.nemo_dino_mesh import nemo_dino_mesh
+    from legoesm.ocean.fidelity.nemo_dino_mesh import (
+        nemo_dino_mesh, nemo_dino_namelist)
     from legoesm.ocean.fidelity.nemo_io import NemoState
     from legoesm.ocean.fidelity.nemo_state_bridge import (
         bridge_nemo_to_legoesm_topo)
@@ -3041,7 +3051,7 @@ def _nemo_faithful_dino_domain(_storage_dtype):
             "PrecisionPolicy.fp64()) before building it. run_dino.py does "
             "this for you on every NEMO-fidelity run.")
 
-    g = nemo_dino_mesh()
+    g = nemo_dino_mesh(nemo_dino_namelist(resolution))
     # The bridge carries a prognostic state across as well; this path starts
     # FROM REST and dino_lat_lon_state replaces T/S/u/v/eta wholesale, so a
     # zero state is both sufficient and honest here.  (Passing the analytic
@@ -3101,17 +3111,19 @@ def dino_lat_lon_grid(cfg: DINOConfig | None = None, n_lon: int = 50):
         # fall outside the basin and every cell is masked land. Fail loudly
         # rather than silently produce a dead domain — the coupled fields come
         # from nemo_faithful_dino_config.
-        if (cfg.lon_west_deg, cfg.lon_east_deg) != (
-                _NEMO_DINO_LON_WEST, _NEMO_DINO_LON_EAST):
+        from legoesm.ocean.fidelity.nemo_dino_mesh import (
+            nemo_dino_domain_size, nemo_dino_namelist)
+        lon_west, lon_east = _nemo_dino_frame(cfg.nemo_resolution)
+        if (cfg.lon_west_deg, cfg.lon_east_deg) != (lon_west, lon_east):
             raise ValueError(
                 f"nemo_faithful_grid=True requires the NEMO "
-                f"[{_NEMO_DINO_LON_WEST:g},{_NEMO_DINO_LON_EAST:g}] longitude "
-                f"frame, got lon_west={cfg.lon_west_deg}, "
+                f"[{lon_west:g},{lon_east:g}] longitude frame "
+                f"({cfg.nemo_resolution}), got lon_west={cfg.lon_west_deg}, "
                 f"lon_east={cfg.lon_east_deg}. Build the config with "
                 "nemo_faithful_dino_config() so the bathymetry frame + sill "
                 "anchor are co-set."
             )
-        br = nemo_faithful_dino_domain()
+        br = nemo_faithful_dino_domain(cfg.nemo_resolution)
         geom = br.geometry
         # The mesh comes from NEMO's namelist, not from cfg, so a cfg field
         # that WOULD have shaped the old create_mercator_grid call must be
@@ -3119,10 +3131,12 @@ def dino_lat_lon_grid(cfg: DINOConfig | None = None, n_lon: int = 50):
         # as being wired.  (All three agree for the shipped cards; a
         # disagreement means the card is asking for a grid this path cannot
         # build.)
-        if (geom.n_lat, geom.n_lon) != (_NEMO_DINO_NLAT, _NEMO_DINO_NLON):
+        n_lon, n_lat, _jpk = nemo_dino_domain_size(
+            nemo_dino_namelist(cfg.nemo_resolution))
+        if (geom.n_lat, geom.n_lon) != (n_lat, n_lon):
             raise ValueError(
                 f"NEMO DINO mesh is {geom.n_lat}x{geom.n_lon}, expected "
-                f"{_NEMO_DINO_NLAT}x{_NEMO_DINO_NLON}.")
+                f"{n_lat}x{n_lon}.")
         if float(geom.omega) != float(cfg.omega):
             raise ValueError(
                 f"nemo_faithful_grid builds Coriolis on NEMO's own rotation "
@@ -3188,10 +3202,11 @@ def _nemo_dino_domain_for(grid, z_coord, land_mask, cfg):
         return None
     if _nemo_dino_source_lat_deg(grid) is None:
         return None
-    _n_lon, _n_lat, jpk = nemo_dino_domain_size()
+    nml = _nemo_dino_namelist_for(grid)
+    _n_lon, _n_lat, jpk = nemo_dino_domain_size(nml)
     if int(z_coord.n_levels) != jpk:
         return None
-    g = nemo_dino_mesh()
+    g = nemo_dino_mesh(nml)
     # The VERTICAL LADDER, not just the level count: NEMO's initial profile is
     # evaluated at NEMO's gdept_0, so a run whose cells are a different size is
     # a different experiment even at the same n_levels (a reviewer halved
@@ -3270,7 +3285,8 @@ def dino_lat_lon_initial_state_arrays(
         # no closed N/S rows) and would give a different domain -- which is
         # exactly the mismatch between the standalone path and every certified
         # twin that this branch removes.
-        land_mask_override = nemo_faithful_dino_domain().land_mask
+        land_mask_override = nemo_faithful_dino_domain(
+            cfg.nemo_resolution).land_mask
 
     lat_deg_1d = jnp.degrees(grid.lat)                        # (n_lat,)
 
@@ -4480,6 +4496,21 @@ _NEMO_DINO_FRAME_TOL_DEG = 1e-3
 _NEMO_DINO_LADDER_TOL_M = 1e-2
 
 
+def _nemo_dino_namelist_for(grid):
+    """The NEMO DINO namelist whose mesh has ``grid``'s shape, or ``None``.
+
+    The meshes' sizes all differ, so the shape names at most one; the caller
+    still checks the latitudes and longitudes.
+    """
+    from legoesm.ocean.fidelity.nemo_dino_mesh import (
+        NEMO_DINO_NAMELISTS, nemo_dino_domain_size)
+    for nml in NEMO_DINO_NAMELISTS.values():
+        n_lon, n_lat, _jpk = nemo_dino_domain_size(nml)
+        if (int(grid.n_lat), int(grid.n_lon)) == (n_lat, n_lon):
+            return nml
+    return None
+
+
 def _nemo_dino_source_lat_deg(grid):
     """NEMO's own degree-valued ``gphit`` for ``grid``, or ``None``.
 
@@ -4516,15 +4547,16 @@ def _nemo_dino_source_lat_deg(grid):
     """
     import jax
 
-    from legoesm.ocean.fidelity.nemo_dino_mesh import (
-        nemo_dino_domain_size, nemo_dino_hgr)
+    from legoesm.ocean.fidelity.nemo_dino_mesh import nemo_dino_hgr
 
-    n_lon, n_lat, _jpk = nemo_dino_domain_size()
-    if (int(grid.n_lat), int(grid.n_lon)) != (n_lat, n_lon):
+    nml = _nemo_dino_namelist_for(grid)
+    if nml is None:
         return None
+    n_lon, n_lat = int(grid.n_lon), int(grid.n_lat)
+    hgr = nemo_dino_hgr(nml)
     # LONGITUDES TOO.  A grid shifted by 180 deg has the same shape and the
     # same latitudes and is emphatically not this basin.
-    lam_t = nemo_dino_hgr()["lam_t"]
+    lam_t = hgr["lam_t"]
     if not np.allclose(np.asarray(jnp.degrees(grid.lon), dtype=np.float64),
                        lam_t, rtol=0.0, atol=_NEMO_DINO_FRAME_TOL_DEG):
         return None
@@ -4535,7 +4567,7 @@ def _nemo_dino_source_lat_deg(grid):
             "read the grid's latitudes as concrete values; they cannot run "
             "with a traced geometry. Build the forcing and the initial state "
             "outside jit/vmap and pass the arrays in.")
-    phi_t = nemo_dino_hgr()["phi_t"]                     # (n_lat,) degrees
+    phi_t = hgr["phi_t"]                                 # (n_lat,) degrees
     gap = float(np.max(np.abs(
         np.asarray(jnp.degrees(grid.lat), dtype=np.float64) - phi_t)))
     if gap > _NEMO_DINO_FRAME_TOL_DEG:

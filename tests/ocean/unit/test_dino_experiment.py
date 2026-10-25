@@ -749,6 +749,34 @@ class TestNemoFaithfulGrid:
         assert cfg.convection_smooth_transition is False
         assert cfg.convection_n2_mode == "adiabatic"
 
+    def test_r4_builds_nemos_quarter_degree_mesh(self, nemo_fp64):
+        import dataclasses
+        from legoesm.ocean.fidelity.nemo_dino_mesh import (
+            NEMO_DINO_R4, nemo_dino_hgr, nemo_dino_istate, nemo_dino_mesh)
+        base = dataclasses.replace(
+            dino_config_for_recipe("nemo_dino_kamm_mlf"), nemo_resolution="R4")
+        cfg = nemo_faithful_dino_config(base=base)
+        assert (cfg.lon_west_deg, cfg.lon_east_deg, cfg.sill_lon_m_deg) == (
+            0.0, 50.25, 0.0)
+        grid = dino_lat_lon_grid(cfg)
+        assert (grid.n_lat, grid.n_lon) == (797, 202)
+        hgr = nemo_dino_hgr(NEMO_DINO_R4)
+        # Forcing and initial state are NEMO's own on this mesh, not the
+        # paper's analytic fallback.
+        assert np.array_equal(dino._nemo_dino_source_lat_deg(grid),
+                              hgr["phi_t"])
+        z = dino.dino_lat_lon_vertical(grid, cfg)
+        st = dino.dino_lat_lon_state(grid, z, cfg)
+        T, S = nemo_dino_istate(nemo_dino_mesh(NEMO_DINO_R4))
+        assert np.array_equal(np.asarray(st.T.data), T)
+        assert np.array_equal(np.asarray(st.S.data), S)
+
+    def test_unknown_resolution_raises(self):
+        import dataclasses
+        with pytest.raises(ValueError, match="unknown NEMO DINO resolution"):
+            nemo_faithful_dino_config(
+                base=dataclasses.replace(DINOConfig(), nemo_resolution="R2"))
+
     def test_flag_without_lon_frame_raises(self):
         # Flipping the flag alone (legoESM [-50,0] frame) would put every grid
         # lon outside the basin -> all land; the builder fails loudly instead.

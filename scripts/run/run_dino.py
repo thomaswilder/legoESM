@@ -52,6 +52,7 @@ import numpy as np
 from legoesm.grids.voronoi import create_regional_voronoi_mesh
 from legoesm.ocean.dynamics.ocean_model_latlon_cgrid import LatLonCGridOceanModel
 from legoesm.ocean.dynamics.ocean_model_mpas import MPASOceanModel
+from legoesm.ocean.fidelity.nemo_dino_mesh import NEMO_DINO_NAMELISTS
 from legoesm.ocean.experiments.dino import (
     DINO_L2_RECIPES,
     DINO_RECIPES,
@@ -170,6 +171,13 @@ def _parse_args():
              "bathymetry lon frame, sill anchor, vertical coordinate, omega "
              "and metric convention via nemo_faithful_dino_config, and returns "
              "the same domain the certified NEMO twin runs on. Lat-lon only.",
+    )
+    p.add_argument(
+        "--nemo-resolution", choices=sorted(NEMO_DINO_NAMELISTS), default=None,
+        help="Which NEMO DINO mesh --nemo-faithful-grid builds "
+             "(DINOConfig.nemo_resolution): R1 = 1 deg 52x199 (default), "
+             "R4 = 1/4 deg 202x797. Any mesh other than R1 also needs an "
+             "explicit --dt.",
     )
     p.add_argument(
         "--tke-momentum-visc-bg", type=float, default=None,
@@ -647,11 +655,22 @@ def main():
     if args.rigid_lid_dt_mom_ratio is not None:
         cfg = dataclasses.replace(
             cfg, rigid_lid_dt_mom_ratio=args.rigid_lid_dt_mom_ratio)
+    if args.nemo_resolution is not None and not args.nemo_faithful_grid:
+        raise SystemExit(
+            "--nemo-resolution only applies with --nemo-faithful-grid.")
     if args.nemo_faithful_grid:
         if args.grid != "latlon":
             raise SystemExit(
                 "--nemo-faithful-grid is lat-lon only (NEMO's Mercator DINO "
                 "mesh); rerun with --grid latlon.")
+        if args.nemo_resolution is not None:
+            # The default timestep is the 1 deg card's 2700 s.
+            if args.nemo_resolution != "R1" and args.dt is None:
+                raise SystemExit(
+                    f"--nemo-resolution {args.nemo_resolution} needs an "
+                    "explicit --dt (the default is the 1 deg 2700 s).")
+            cfg = dataclasses.replace(
+                cfg, nemo_resolution=args.nemo_resolution)
         # Applied LAST: co-sets the bathymetry lon frame + sill anchor onto
         # whatever recipe/overrides preceded it (must not be clobbered after).
         cfg = nemo_faithful_dino_config(base=cfg)

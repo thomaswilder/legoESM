@@ -123,6 +123,23 @@ NEMO_DINO_R1 = NemoDinoNamelist(
     ln_zco_nam=True,
 )
 
+#: DINO at 1/4 deg: R1 with only the resolution changed.  NEMO's DINO repo
+#: (vopikamm/DINO v0.2.0) ships no 1/4 deg namelist and has no 1/4 deg mesh to
+#: check against; the other grid values may need updating once checked.
+NEMO_DINO_R4 = NEMO_DINO_R1._replace(rn_e1_deg=0.25)
+
+#: The DINO meshes a run can name (``DINOConfig.nemo_resolution``).
+NEMO_DINO_NAMELISTS = {"R1": NEMO_DINO_R1, "R4": NEMO_DINO_R4}
+
+
+def nemo_dino_namelist(name: str) -> NemoDinoNamelist:
+    """The namelist for ``name`` (a key of :data:`NEMO_DINO_NAMELISTS`)."""
+    if name not in NEMO_DINO_NAMELISTS:
+        raise ValueError(
+            f"unknown NEMO DINO resolution {name!r}; choose from "
+            f"{sorted(NEMO_DINO_NAMELISTS)}")
+    return NEMO_DINO_NAMELISTS[name]
+
 
 # ---------------------------------------------------------------------------
 # usrdef_nam.F90 — domain size
@@ -671,7 +688,8 @@ def nemo_dino_istate(g: NemoGrid, nn_initcase: int = 4):
 
 
 __all__ = (
-    "NemoDinoNamelist", "NEMO_DINO_R1", "merc_proj", "nemo_dino_domain_size",
+    "NemoDinoNamelist", "NEMO_DINO_R1", "NEMO_DINO_R4", "NEMO_DINO_NAMELISTS",
+    "nemo_dino_namelist", "merc_proj", "nemo_dino_domain_size",
     "mi96_1d", "depth_to_e3_1d", "e3_to_depth_1d", "vertical_ladders",
     "nemo_dino_hgr", "nemo_dino_bathymetry", "nemo_dino_mesh",
     "nemo_dino_istate",

@@ -36,6 +36,19 @@ def test_domain_size_is_nemos():
     assert ndm.nemo_dino_domain_size() == (52, 199, 36)
 
 
+def test_r4_differs_from_r1_only_in_resolution():
+    diff = {f for f in ndm.NemoDinoNamelist._fields
+            if getattr(ndm.NEMO_DINO_R4, f) != getattr(ndm.NEMO_DINO_R1, f)}
+    assert diff == {"rn_e1_deg"}
+    assert ndm.nemo_dino_domain_size(ndm.NEMO_DINO_R4) == (202, 797, 36)
+
+
+def test_namelist_lookup_raises_on_unknown_name():
+    assert ndm.nemo_dino_namelist("R4") is ndm.NEMO_DINO_R4
+    with pytest.raises(ValueError, match="unknown NEMO DINO resolution"):
+        ndm.nemo_dino_namelist("R2")
+
+
 def test_merc_proj_matches_nemos_printed_indices():
     # ocean.output:28-29 prints these two, so they are the oracle's own answer.
     assert ndm.merc_proj(70.0, 1.0) == -98

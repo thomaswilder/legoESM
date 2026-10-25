@@ -144,6 +144,32 @@ def test_nemo_faithful_grid_flag_parses(monkeypatch):
     assert args.nemo_faithful_grid is True
 
 
+def test_nemo_resolution_flag_parses_and_defaults_none(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["run_dino", "--nemo-resolution", "R4"])
+    assert rd._parse_args().nemo_resolution == "R4"
+    monkeypatch.setattr(sys, "argv", ["run_dino"])
+    assert rd._parse_args().nemo_resolution is None
+    monkeypatch.setattr(sys, "argv", ["run_dino", "--nemo-resolution", "R2"])
+    with pytest.raises(SystemExit):
+        rd._parse_args()
+
+
+@pytest.mark.parametrize("argv, match", [
+    (["--nemo-resolution", "R4"], "only applies with --nemo-faithful-grid"),
+    (["--grid", "latlon", "--nemo-faithful-grid", "--nemo-resolution", "R4"],
+     "needs an explicit --dt"),
+])
+def test_nemo_resolution_guards(monkeypatch, argv, match):
+    from legoesm.core.precision import get_policy, set_policy
+    prev = get_policy()
+    monkeypatch.setattr(sys, "argv", ["run_dino", *argv])
+    try:
+        with pytest.raises(SystemExit, match=match):
+            rd.main()
+    finally:
+        set_policy(prev)
+
+
 def test_nemo_faithful_grid_default_false(monkeypatch):
     # Opt-in: absent flag keeps the legoESM [-50,0]/198×50 grid.
     monkeypatch.setattr(sys, "argv", ["run_dino"])

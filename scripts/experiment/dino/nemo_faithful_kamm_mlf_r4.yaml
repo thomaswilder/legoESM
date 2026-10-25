@@ -1,0 +1,25 @@
+# DINO at 1/4 degree on the NEMO-faithful card, standalone.
+#
+# Same card as nemo_faithful_kamm_mlf.yaml (read its header) on NEMO's DINO
+# mesh at 1/4 degree: 202 x 797 x 36, built from NEMO's 1 degree namelist with
+# only rn_e1_deg = 0.25 (nemo_dino_mesh.NEMO_DINO_R4). The basin walls move to
+# U-faces [0, 50.25]. Initial state and forcing are NEMO's own on this mesh.
+#
+# NOT VALIDATED. No NEMO 1/4 degree mesh or run exists to check against
+# (NEMO's DINO repo and Zenodo 15016824 have only 1 and 1/16 degree).
+#
+# INCOMPLETE: the resolution-dependent settings are still to be chosen.
+#   dt                 -- required; run_dino refuses this mesh without it.
+#   barotropic sub-steps, eddy parameterisation, lateral friction,
+#   iso-neutral diffusion -- the recipe's 1 degree values apply until set
+#   (sub-steps = 23, fixed; no run_dino flag sets it yet).
+#
+#   JAX_PLATFORMS=cuda JAX_ENABLE_X64=1 python scripts/run/run_dino.py \
+#       --config scripts/experiment/dino/nemo_faithful_kamm_mlf_r4.yaml \
+#       --dt <s> --days <n>
+recipe: nemo_dino_kamm_mlf
+nemo_faithful_grid: true
+nemo_resolution: R4
+grid: latlon
+snapshot_every_days: 30
+output_dir: results/dino_nemo_faithful_kamm_mlf_r4
