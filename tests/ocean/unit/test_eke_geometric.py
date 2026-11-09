@@ -639,3 +639,138 @@ def test_geometric_cold_start_without_eke_field():
     E = np.asarray(state.eke.data)
     assert E.shape == (grid.n_lat, grid.n_lon)
     assert np.all(E >= 0.0) and np.all(np.isfinite(E))
+
+
+# ---------------------------------------------------------------------------
+# Staircase / partial-cell bathymetry: the GEOMETRIC column integrals and the
+# step kappa must stop at the seafloor and ignore sub-seafloor tracer values.
+# ---------------------------------------------------------------------------
+
+
+def _shallow_left_half(z, n_lat, n_lon, n_wet=3):
+    """Partial-cell coordinate whose west half ends exactly on the bottom of
+    level ``n_wet - 1`` (east half full depth), so no partial bottom cell."""
+    from legoesm.ocean.vertical import create_partial_cell_coordinate
+
+    H = np.full((n_lat, n_lon), float(-np.asarray(z.z_half_ref)[-1]))
+    H[:, : n_lon // 2] = float(-np.asarray(z.z_half_ref)[n_wet])
+    zp = create_partial_cell_coordinate(z, jnp.asarray(H))
+    act = np.asarray(zp.is_active)
+    assert act[0, 0].sum() == n_wet and act[0, -1].all(), "fixture dead"
+    return zp, H, act
+
+
+def test_column_integrals_stop_at_seafloor_on_partial_cells():
+    from legoesm.ocean.physics.lateral_mixing._gm_redi_common import (
+        compute_geometric_column_integrals,
+    )
+    from legoesm.ocean.physics.lateral_mixing.config import VisbeckConfig
+
+    N2c, S0 = 1.0e-5, 5.0e-4
+    rho, S_x, S_y, z, jac, dz_half, rho_ref = _manufactured_column(
+        N2c=N2c, S0=S0)
+    zp, _H, act = _shallow_left_half(z, 4, 6)
+    iface = act[..., :-1] & act[..., 1:]
+    f = jnp.full((4, 6), 1.0e-4)
+    int_s2, int_s, int_N, H_col, wet = compute_geometric_column_integrals(
+        rho, S_x, S_y, zp, jac, f, VisbeckConfig(), rho_ref=rho_ref,
+        interface_active=jnp.asarray(iface), active_3d=jnp.asarray(act))
+    W = np.sum(dz_half * iface, axis=-1)            # wet interfaces only
+    N = np.sqrt(N2c)
+    np.testing.assert_allclose(np.asarray(H_col),
+                               np.sum(np.asarray(z.dz_ref) * act, axis=-1),
+                               rtol=1e-6)   # float32 dz_ref, summation order
+    np.testing.assert_allclose(np.asarray(int_N), N * W, rtol=1e-6)
+    np.testing.assert_allclose(np.asarray(int_s), N * S0 * W, rtol=1e-6)
+    np.testing.assert_allclose(np.asarray(int_s2), N2c * S0 ** 2 * W,
+                               rtol=1e-6)
+    assert float(H_col[0, 0]) < 0.5 * float(H_col[0, -1])
+
+
+def _step_kappa_on_staircase(T_dry, S_dry):
+    from legoesm.grids.latlon import create_latlon_grid
+    from legoesm.ocean.vertical import create_ocean_z_star
+    from legoesm.ocean.state import LatLonCGridOceanConfig
+    from legoesm.ocean.physics.lateral_mixing.config import GMRediConfig
+    from legoesm.ocean.physics.lateral_mixing.gm_redi_latlon_cgrid import (
+        compute_geometric_step_kappa,
+    )
+
+    n_lat, n_lon, nlev = 12, 16, 5
+    grid = create_latlon_grid(n_lat, n_lon, dtype=jnp.float64)
+    z = create_ocean_z_star(n_levels=nlev, H_max=4000.0)
+    zp, H, act = _shallow_left_half(z, n_lat, n_lon)
+    lat = np.degrees(np.asarray(grid.lat))
+    T = (2.0 * np.tanh(lat / 20.0)[:, None, None]
+         + np.linspace(20.0, 4.0, nlev)[None, None, :]
+         * np.ones((n_lat, n_lon, nlev)))
+    S = np.full((n_lat, n_lon, nlev), 35.0)
+    T = np.where(act, T, T_dry)
+    S = np.where(act, S, S_dry)
+    geom = GeometricConfig()
+    gm = GMRediConfig(kappa_GM=0.0, kappa_Redi=1.0e3,
+                      eke=EKEConfig(closure="geometric", geometric=geom))
+    mc = LatLonCGridOceanConfig.from_flat(gm_redi=gm)
+    out = compute_geometric_step_kappa(
+        jnp.asarray(T), jnp.asarray(S), jnp.zeros((n_lat, n_lon)),
+        jnp.asarray(H), None, grid, zp, gm,
+        eos=mc.eos, eos_linear=mc.eos_linear, mask=jnp.ones((n_lat, n_lon)),
+        rho_0=mc.constants.rho_0, g=mc.constants.g)
+    return out, act, geom, np.asarray(z.dz_ref)
+
+
+def test_step_kappa_ignores_sub_seafloor_tracer_values():
+    """Dry cells below a step hold the IC fill (T=S=0). Their contents must
+    not reach kappa_gm through the slopes or N² next to the step."""
+    a, _, _, _ = _step_kappa_on_staircase(T_dry=0.0, S_dry=0.0)
+    b, _, _, _ = _step_kappa_on_staircase(T_dry=30.0, S_dry=20.0)
+    for name, x, y in zip(("eke_int", "kappa_gm", "production_bc", "L_eff"),
+                          (a[0], a[1], a[3], a[4]), (b[0], b[1], b[3], b[4])):
+        np.testing.assert_array_equal(np.asarray(x), np.asarray(y),
+                                      err_msg=name)
+
+
+def test_step_kappa_cold_start_uses_wet_depth_on_partial_cells():
+    """Cold-start ∫EKE dz = e0·H_col counts wet cells only, and the returned
+    cell thickness is zero below the seafloor."""
+    (eke_int, _k, _kn, _bc, _L, dz_actual), act, geom, dz_ref = (
+        _step_kappa_on_staircase(T_dry=0.0, S_dry=0.0))
+    dz_actual = np.asarray(dz_actual)
+    assert np.all(dz_actual[~act] == 0.0)
+    np.testing.assert_allclose(
+        np.asarray(eke_int), geom.e0_per_depth * np.sum(dz_ref * act, -1),
+        rtol=1e-6)   # EKE is pinned to float32 storage
+
+
+def test_seed_scan_carry_seeds_geometric_eke_as_e0_times_depth():
+    """A GEOMETRIC carry seeded from state.eke=None must hold the closure's own
+    cold start ∫EKE dz = e0·H [m³/s²], not the E-G floor e_min [m²/s²]."""
+    from legoesm.grids.latlon import create_latlon_grid
+    from legoesm.ocean.vertical import create_ocean_z_star
+    from legoesm.ocean.init_latlon_cgrid import rest_state_latlon_cgrid_ocean
+    from legoesm.ocean.state import LatLonCGridOceanConfig
+    from legoesm.ocean.physics.lateral_mixing.config import GMRediConfig
+    from legoesm.ocean.dynamics.ocean_model_latlon_cgrid import (
+        LatLonCGridOceanModel,
+    )
+    geom = GeometricConfig()
+    grid = create_latlon_grid(8, 16)
+    z = create_ocean_z_star(n_levels=3, H_max=4000.0)
+    state = rest_state_latlon_cgrid_ocean(
+        grid, z, H_max=4000.0, land_lat_threshold=85.0)
+    cfg = LatLonCGridOceanConfig.from_flat(
+        A_h=2.0e4, bottom_drag_r=1.0e-3, implicit_vertical_mixing=True,
+        n_barotropic_substeps=8, enable_runtime_checks=False,
+        gm_redi=GMRediConfig(kappa_GM=0.0, kappa_Redi=1.0e3,
+                             eke=EKEConfig(closure="geometric",
+                                           geometric=geom)))
+    model = LatLonCGridOceanModel(grid, z, cfg)
+    assert state.eke is None
+    seeded = model.seed_scan_carry(state, 1800.0)
+    assert seeded.eke.units == "m^3/s^2"
+    assert seeded.eke.dims == ("lat", "lon")
+    expected = (geom.e0_per_depth * np.asarray(state.H_bathy.data)
+                * np.asarray(state.land_mask.data))
+    np.testing.assert_allclose(np.asarray(seeded.eke.data), expected,
+                               rtol=1e-6)
+    assert float(np.max(expected)) > 10.0 * EKEConfig().e_min

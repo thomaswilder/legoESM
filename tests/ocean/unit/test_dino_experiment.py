@@ -2960,3 +2960,54 @@ class TestShortwavePenetrationLadder:
         np.testing.assert_allclose(
             np.asarray(restoring_static), np.asarray(restoring_ladder_live),
             rtol=1e-10, atol=1e-14)
+
+
+def test_dino_geometric_wiring_and_state_seed():
+    """gm_kappa_scheme='geometric' reaches the model's EKE closure with the
+    DINOConfig values, and the initial state carries ∫EKE dz = e0·H [m³/s²]."""
+    from legoesm.ocean.experiments.dino import (
+        DINOConfig, create_dino_z_star, dino_lat_lon_grid,
+        dino_lat_lon_model_config, dino_lat_lon_state,
+    )
+    base = DINOConfig()
+    geo = dataclasses.replace(base, gm_kappa_scheme="geometric",
+                              geometric_alpha=0.07,
+                              geometric_e0_per_depth=2.0e-6)
+    g = dino_lat_lon_grid(geo, n_lon=8)
+    mc, _ = dino_lat_lon_model_config(g, geo, physics=True)
+    assert mc.gm_redi.eke.closure == "geometric"
+    assert mc.gm_redi.eke.geometric.alpha == 0.07
+    assert mc.gm_redi.eke.geometric.e0_per_depth == 2.0e-6
+    mc_base, _ = dino_lat_lon_model_config(g, base, physics=True)
+    assert mc_base.gm_redi.eke is None
+    z = create_dino_z_star(geo)
+    st = dino_lat_lon_state(g, z, geo)
+    assert st.eke.units == "m^3/s^2" and st.eke.dims == ("lat", "lon")
+    np.testing.assert_allclose(
+        np.asarray(st.eke.data),
+        2.0e-6 * np.asarray(st.H_bathy.data) * np.asarray(st.land_mask.data),
+        rtol=1e-12)
+    assert dino_lat_lon_state(g, z, base).eke is None
+
+
+def test_apply_lat_lon_surface_forcing_accepts_traced_layer_thickness():
+    """A gradient script that passes the vertical grid as a traced argument
+    must not hit float() on the top-layer thickness."""
+    import jax
+    from legoesm.ocean.experiments.dino import (
+        DINOConfig, create_dino_z_star, dino_lat_lon_grid,
+        dino_lat_lon_state, dino_lat_lon_surface_forcing_arrays,
+        apply_dino_lat_lon_surface_forcing,
+    )
+    cfg = DINOConfig()
+    z = create_dino_z_star(cfg)
+    g = dino_lat_lon_grid(cfg, n_lon=8)
+    st = dino_lat_lon_state(g, z, cfg)
+    frc = dino_lat_lon_surface_forcing_arrays(g, cfg)
+    eager = apply_dino_lat_lon_surface_forcing(st, frc, z, cfg, 2700.0)
+    traced = jax.jit(lambda dz: apply_dino_lat_lon_surface_forcing(
+        st, frc, z._replace(dz_ref=dz), cfg, 2700.0))(z.dz_ref)
+    for name in ("T", "S", "u"):
+        np.testing.assert_allclose(
+            np.asarray(getattr(traced, name).data),
+            np.asarray(getattr(eager, name).data), rtol=1e-12, err_msg=name)

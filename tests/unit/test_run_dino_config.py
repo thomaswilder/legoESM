@@ -624,3 +624,11 @@ def test_r4_geometric_config_flags_parse(monkeypatch):
     assert args.n_barotropic_substeps == 25
     assert args.gm_kappa_scheme == "geometric"
     assert args.geometric_alpha == 0.04
+
+
+def test_geometric_e0_per_depth_flag_parses_and_defaults_none(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["run_dino"])
+    assert rd._parse_args().geometric_e0_per_depth is None
+    monkeypatch.setattr(sys, "argv", ["run_dino", "--geometric-e0-per-depth",
+                                      "1e-3"])
+    assert rd._parse_args().geometric_e0_per_depth == 1e-3

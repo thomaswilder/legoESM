@@ -46,6 +46,7 @@ import dataclasses
 import json
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -219,6 +220,13 @@ def _parse_args():
         help="GEOMETRIC eddy efficiency alpha (DINOConfig.geometric_alpha, "
              "default 0.04; Torres et al. 2025 Eq. 6). Ignored unless "
              "--gm-kappa-scheme geometric.",
+    )
+    p.add_argument(
+        "--geometric-e0-per-depth", type=float, default=None,
+        help="GEOMETRIC cold-start depth-mean EKE [m2/s2]: the initial "
+             "integral of EKE over depth is this times the column depth "
+             "(DINOConfig.geometric_e0_per_depth, default 1e-6; Torres et al. "
+             "2025 App. E). Ignored unless --gm-kappa-scheme geometric.",
     )
     p.add_argument(
         "--n-barotropic-substeps", type=int, default=None,
@@ -565,8 +573,9 @@ def _force_fp64_for_nemo_fidelity(args) -> None:
           f"(control={policy.control}, storage={policy.storage})", flush=True)
 
 
-def main():
-    args = _parse_args()
+def build_run(args):
+    """Resolve the DINOConfig and build grid, vertical coordinate, initial
+    state, model and forcing for ``args``: everything ``main`` steps."""
     _force_fp64_for_nemo_fidelity(args)
 
     # JAX x64 sanity check: DINO uses Wright EOS + barotropic split;
@@ -640,6 +649,9 @@ def main():
         cfg = dataclasses.replace(cfg, gm_kappa_scheme=args.gm_kappa_scheme)
     if args.geometric_alpha is not None:
         cfg = dataclasses.replace(cfg, geometric_alpha=args.geometric_alpha)
+    if args.geometric_e0_per_depth is not None:
+        cfg = dataclasses.replace(
+            cfg, geometric_e0_per_depth=args.geometric_e0_per_depth)
     if args.n_barotropic_substeps is not None:
         cfg = dataclasses.replace(
             cfg, n_barotropic_substeps=args.n_barotropic_substeps)
@@ -790,6 +802,74 @@ def main():
         sf_step = None
         grid_desc = f"{grid.nCells} cells MPAS regional Voronoi"
 
+    # The rigid_lid faithful stack uses the ab2 outer integrator + a
+    # streamfunction (ψ, dψ, dψ_prev, dpsin, dpsin_prev) carry; seed them (and
+    # the rigid-lid island cache + dtype reconciliation) once from the concrete
+    # initial state before the eager step loop, so the first step has a complete
+    # carry. lat-lon only (rigid_lid is rejected on MPAS upstream).
+    # barotropic_slow_forcing_ab2 (the 'oceananigans' card's Gᵁ AB2
+    # time-centering) likewise needs its F_slow_{u,v}_prev carry seeded before
+    # step 1 (_step_impl raises on an unseeded prev); seed_scan_carry now does
+    # that too. Other stacks keep the eager-loop path byte-identical.
+    if grid_kind == "latlon" and (
+            cfg.barotropic_solver == "rigid_lid"
+            or model_cfg.flat_get("barotropic_slow_forcing_ab2")):
+        state = model.seed_scan_carry(state, dt)
+
+    # #1492: NEMO-faithful surface-tracer-tendency placement (lat-lon only —
+    # the MPAS applicator has no return_rate= mode / model.step has no
+    # external_tracer_rate hook there). "applied_now" (default) keeps the
+    # legacy pre-step state mutation; "leapfrog_rhs" folds the tendency into
+    # the leap-frog Nnn RHS instead (see DINOConfig.surface_tendency_placement).
+    _sf_placement = getattr(cfg, "surface_tendency_placement", "applied_now")
+    if _sf_placement not in ("applied_now", "leapfrog_rhs"):
+        raise SystemExit(
+            f"Unknown DINOConfig.surface_tendency_placement {_sf_placement!r}: "
+            "expected 'applied_now' or 'leapfrog_rhs'.")
+    if _sf_placement == "leapfrog_rhs" and grid_kind != "latlon":
+        raise SystemExit(
+            "surface_tendency_placement='leapfrog_rhs' is only wired for "
+            "--grid latlon (apply_dino_mpas_surface_forcing has no "
+            "return_rate= mode).")
+
+    return SimpleNamespace(
+        cfg=cfg, dt=dt, grid_kind=grid_kind, grid=grid, z=z, state=state,
+        model_cfg=model_cfg, model=model, forcing=forcing,
+        apply_forcing=apply_forcing, sf_step=sf_step, grid_desc=grid_desc,
+        sf_placement=_sf_placement)
+
+
+def advance(run, state, k, model=None):
+    """One driver step k: surface forcing, then the model step. ``model``
+    overrides ``run.model`` (e.g. a copy carrying traced parameters)."""
+    model = run.model if model is None else model
+    cfg, dt, forcing = run.cfg, run.dt, run.forcing
+    _ext_rate = None
+    if forcing is not None:
+        # NEMO time convention: step k (0-based) ends at t=(k+1)*dt —
+        # drives the seasonal forcing phases when forcing_annual_cycle.
+        if run.sf_placement == "leapfrog_rhs":
+            state, _ext_rate = run.apply_forcing(
+                state, forcing, run.z, cfg, dt, t_seconds=(k + 1) * dt,
+                return_rate=True)
+        else:
+            state = run.apply_forcing(state, forcing, run.z, cfg, dt,
+                                      t_seconds=(k + 1) * dt)
+
+    return model.step(
+        state, dt=dt,
+        surface_forcing=(run.sf_step if getattr(cfg, "wind_through_step",
+                                                False) else None),
+        external_tracer_rate=_ext_rate)
+
+
+def main():
+    args = _parse_args()
+    run = build_run(args)
+    cfg, dt, grid_kind, grid, z = (
+        run.cfg, run.dt, run.grid_kind, run.grid, run.z)
+    state, grid_desc = run.state, run.grid_desc
+
     # Output directory
     args.output_dir.mkdir(parents=True, exist_ok=True)
     snapshot_dir = args.output_dir / "snapshots"
@@ -812,58 +892,12 @@ def main():
     print(f"{'step':>6} {'day':>7} {'|u|':>10} {'|v|':>10} {'|eta|':>10} "
           f"{'T_max':>7} {'T_min':>7} {'KE':>10}")
 
-    # The rigid_lid faithful stack uses the ab2 outer integrator + a
-    # streamfunction (ψ, dψ, dψ_prev, dpsin, dpsin_prev) carry; seed them (and
-    # the rigid-lid island cache + dtype reconciliation) once from the concrete
-    # initial state before the eager step loop, so the first step has a complete
-    # carry. lat-lon only (rigid_lid is rejected on MPAS upstream).
-    # barotropic_slow_forcing_ab2 (the 'oceananigans' card's Gᵁ AB2
-    # time-centering) likewise needs its F_slow_{u,v}_prev carry seeded before
-    # step 1 (_step_impl raises on an unseeded prev); seed_scan_carry now does
-    # that too. Other stacks keep the eager-loop path byte-identical.
-    if grid_kind == "latlon" and (
-            cfg.barotropic_solver == "rigid_lid"
-            or model_cfg.flat_get("barotropic_slow_forcing_ab2")):
-        state = model.seed_scan_carry(state, dt)
-
     t_wall_start = time.time()
     snapshot_idx = 0
     _save_snapshot(state, 0.0, snapshot_dir, snapshot_idx, grid_kind)
 
-    # #1492: NEMO-faithful surface-tracer-tendency placement (lat-lon only —
-    # the MPAS applicator has no return_rate= mode / model.step has no
-    # external_tracer_rate hook there). "applied_now" (default) keeps the
-    # legacy pre-step state mutation; "leapfrog_rhs" folds the tendency into
-    # the leap-frog Nnn RHS instead (see DINOConfig.surface_tendency_placement).
-    _sf_placement = getattr(cfg, "surface_tendency_placement", "applied_now")
-    if _sf_placement not in ("applied_now", "leapfrog_rhs"):
-        raise SystemExit(
-            f"Unknown DINOConfig.surface_tendency_placement {_sf_placement!r}: "
-            "expected 'applied_now' or 'leapfrog_rhs'.")
-    if _sf_placement == "leapfrog_rhs" and grid_kind != "latlon":
-        raise SystemExit(
-            "surface_tendency_placement='leapfrog_rhs' is only wired for "
-            "--grid latlon (apply_dino_mpas_surface_forcing has no "
-            "return_rate= mode).")
-
     for k in range(n_steps_total):
-        _ext_rate = None
-        if forcing is not None:
-            # NEMO time convention: step k (0-based) ends at t=(k+1)*dt —
-            # drives the seasonal forcing phases when forcing_annual_cycle.
-            if _sf_placement == "leapfrog_rhs":
-                state, _ext_rate = apply_forcing(
-                    state, forcing, z, cfg, dt, t_seconds=(k + 1) * dt,
-                    return_rate=True)
-            else:
-                state = apply_forcing(state, forcing, z, cfg, dt,
-                                      t_seconds=(k + 1) * dt)
-
-        state = model.step(
-            state, dt=dt,
-            surface_forcing=(sf_step if getattr(cfg, "wind_through_step",
-                                                False) else None),
-            external_tracer_rate=_ext_rate)
+        state = advance(run, state, k)
 
         is_last = (k == n_steps_total - 1)
         if (k + 1) % snapshot_every_steps == 0 or is_last:
