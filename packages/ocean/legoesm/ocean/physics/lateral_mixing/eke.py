@@ -9,6 +9,7 @@ Two selectable closures (``EKEConfig.closure``):
    GEOMETRIC ``kappa_gm = alpha·∫EKE dz / ∫(M²/N) dz`` of Mak, Marshall et
    al. 2022 / D. P. Marshall et al. 2012, with EKE in place of total eddy
    energy).  Depth-INTEGRATED 2-D budget — see :class:`GeometricConfig`.
+3. #TODO Add in the scale-aware GEOMETRIC from Mak et al. (2023).
 
 Eden & Greatbatch (2008): a 2-D (depth-integrated) eddy-energy field ``E``
 whose budget is
