@@ -35,3 +35,22 @@ def test_alpha_gradient_matches_finite_difference_and_restores_policy():
     assert math.isfinite(r["ad"]) and r["ad"] != 0.0
     # 1e-3: FD round-off alone spreads the two FD values by ~3e-4 here.
     assert abs(r["ad"] - fd) / abs(fd) < 1.0e-3
+
+
+@pytest.mark.slow
+def test_alpha_gradient_finite_over_two_steps_on_nemo_faithful_card():
+    """Two steps of the 1 degree NEMO-faithful card (TKE, NEMO-literal
+    branches). TKE is exactly 0 at dry W points; a plain sqrt there made the
+    step-2 gradient NaN (GPU job 66418927) while FD stayed clean."""
+    import jax
+
+    if not jax.config.x64_enabled:
+        pytest.skip("needs JAX_ENABLE_X64=1")
+    card = _REPO / "scripts" / "experiment" / "dino" / "nemo_faithful_kamm_mlf.yaml"
+    r = gc.alpha_gradient_check(
+        ["--config", str(card), "--gm-kappa-scheme", "geometric",
+         "--geometric-e0-per-depth", "1e-3"],
+        n_steps=2, eps_rel=1.0e-3)
+    fd = r["fd"][max(r["fd"])]
+    assert math.isfinite(r["ad"]) and r["ad"] != 0.0
+    assert abs(r["ad"] - fd) / abs(fd) < 1.0e-3

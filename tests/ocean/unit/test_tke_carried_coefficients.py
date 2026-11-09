@@ -1615,3 +1615,16 @@ def test_nemo_literal_matrix_pins_every_row_including_jpkm1(monkeypatch):
     assert no_deep_diss != diag[3]                     # jpkm1-only mutation
     swapped = 1.0 - lw[0] - up[0] + 0.7 * dissl[0]     # 1.5 <-> 0.5 weights
     assert swapped != diag[0]
+
+
+def test_literal_raw_mxl_gradient_finite_at_zero_tke():
+    """TKE is exactly 0 at dry W points. There d sqrt(2e/N2) is infinite and
+    the mixing-length floor passes it a zero cotangent: a plain sqrt makes the
+    gradient 0*inf = NaN (the DINO step-2 NaN)."""
+    cfg = TKEConfig(tke_mxl_choice=3, mxl_min=0.01,
+                    tke_mxl_raw_evaluation="nemo_literal")
+    n2 = jnp.full((1, 3), 1.0e-5)
+    g = jax.grad(lambda e: jnp.sum(tke_mod._tke_raw_mixing_length(e, n2, cfg)))(
+        jnp.asarray([[0.0, 1.0e-4, 0.0]]))
+    assert bool(jnp.all(jnp.isfinite(g)))
+    assert float(g[0, 1]) > 0.0

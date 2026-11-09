@@ -1033,8 +1033,12 @@ def _tke_raw_mixing_length(
         # rsmall=0.5*EPSILON(1.e0), then SQRT((2*en)/zrn2).
         rsmall = 0.5 * jnp.finfo(e.dtype).eps
         zrn2 = jnp.maximum(n2, rsmall)
+        # Double-where sqrt (as the factored branch): en == 0 at dry W
+        # points gives d sqrt = inf, and 0*inf = NaN in the backward pass.
+        arg = (jnp.asarray(2.0, e.dtype) * e) / zrn2
         return jnp.maximum(
-            jnp.sqrt((jnp.asarray(2.0, e.dtype) * e) / zrn2),
+            jnp.where(arg > 0.0, jnp.sqrt(jnp.where(arg > 0.0, arg, 1.0)),
+                      0.0),
             mxl_min)
     raise ValueError(
         "Unknown TKEConfig.tke_mxl_raw_evaluation: expected "
@@ -3513,7 +3517,12 @@ def tke_vertical_mixing(
     if _matrix_eval == "nemo_literal":
         # Post-solve tke_avn overwrite, MY_SRC/zdftke.F90:832-837.  Keep the
         # source association: zsqen=SQRT(en), then dissl=zsqen/zmxld.
-        dissl_new = jnp.sqrt(tke_curr) / l_eps_final
+        # Double-where sqrt: en == 0 at dry W points, where d sqrt = inf and
+        # the next step's zero cotangent there made the gradient 0*inf = NaN.
+        zsqen = jnp.where(tke_curr > 0.0,
+                          jnp.sqrt(jnp.where(tke_curr > 0.0, tke_curr, 1.0)),
+                          0.0)
+        dissl_new = zsqen / l_eps_final
     _statement_trace = None
     if return_statement_trace:
         if any(value is None for value in (
