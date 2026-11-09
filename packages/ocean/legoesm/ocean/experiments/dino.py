@@ -3633,10 +3633,21 @@ def dino_lat_lon_model_config(
     from legoesm.ocean.physics.lateral_mixing.eke import (
         EKEConfig, GeometricConfig, validate_eke_config,
     )
+    from legoesm.ocean.physics.lateral_mixing.eke import (
+        __param_spec__ as _eke_param_spec,
+    )
     if cfg.gm_kappa_scheme not in ("visbeck", "treguier", "geometric"):
         raise ValueError(
             f"unknown DINOConfig.gm_kappa_scheme {cfg.gm_kappa_scheme!r}; "
             "expected 'visbeck', 'treguier', or 'geometric'")
+    # The spec's bounds are the one declared range for alpha (user decision
+    # 2026-11-09: reject outside it rather than run).
+    _lo, _hi = _eke_param_spec["GeometricConfig"]["params"]["alpha"]["bounds"]
+    if (cfg.use_gm_redi and cfg.gm_kappa_scheme == "geometric"
+            and not _lo <= cfg.geometric_alpha <= _hi):
+        raise ValueError(
+            f"DINOConfig.geometric_alpha={cfg.geometric_alpha!r} is outside "
+            f"the GEOMETRIC alpha spec bounds [{_lo}, {_hi}]")
     _eke_cfg = (
         EKEConfig(
             closure="geometric",

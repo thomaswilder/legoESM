@@ -3011,3 +3011,24 @@ def test_apply_lat_lon_surface_forcing_accepts_traced_layer_thickness():
         np.testing.assert_allclose(
             np.asarray(getattr(traced, name).data),
             np.asarray(getattr(eager, name).data), rtol=1e-12, err_msg=name)
+
+
+@pytest.mark.parametrize("alpha, ok", [(0.0131, False), (0.0132, True),
+                                       (0.04, True), (0.12, True),
+                                       (0.121, False)])
+def test_dino_geometric_alpha_rejected_outside_spec_bounds(alpha, ok):
+    from legoesm.ocean.experiments.dino import (
+        DINOConfig, dino_lat_lon_grid, dino_lat_lon_model_config,
+    )
+    cfg = dataclasses.replace(DINOConfig(), gm_kappa_scheme="geometric",
+                              geometric_alpha=alpha)
+    g = dino_lat_lon_grid(cfg, n_lon=8)
+    if ok:
+        mc, _ = dino_lat_lon_model_config(g, cfg, physics=True)
+        assert mc.gm_redi.eke.geometric.alpha == alpha
+    else:
+        with pytest.raises(ValueError, match="spec bounds"):
+            dino_lat_lon_model_config(g, cfg, physics=True)
+    # Other schemes ignore geometric_alpha.
+    dino_lat_lon_model_config(
+        g, dataclasses.replace(cfg, gm_kappa_scheme="treguier"), physics=True)
