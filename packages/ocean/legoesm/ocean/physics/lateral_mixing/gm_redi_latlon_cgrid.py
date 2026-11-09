@@ -5503,6 +5503,8 @@ def _eke_stage1_fields(
     """
     if mask is None:
         mask = jnp.ones(T.shape[:2], dtype=T.dtype)
+    T = _fill_dry_cells_columnwise(T, z_coord)
+    S = _fill_dry_cells_columnwise(S, z_coord)
     jacobian = compute_ocean_jacobian(eta, H_bathy, z_coord)
     eos_fn = make_eos_fn(eos, eos_linear)
     fill_fn = lambda field: neumann_fill_cgrid(field, mask)
@@ -5650,11 +5652,16 @@ def compute_geometric_step_kappa(
         eos=eos, eos_linear=eos_linear, mask=mask, rho_0=rho_0, g=g,
         omega=omega, r_earth=r_earth,
     )
+    _is_act = getattr(z_coord, "is_active", None)
+    _iface_act = (
+        (_is_act[..., :-1] & _is_act[..., 1:]) if _is_act is not None else None
+    )
     int_sigma2_dz, int_sigma_dz, int_N_dz, H_col, wet_col = (
         compute_geometric_column_integrals(
             rho, S_x, S_y, z_coord, jacobian, f_coriolis, cfg.visbeck,
             rho_ref=rho_0, n2_mode=getattr(cfg.eke, "n2_mode", "insitu"),
             n2_over_dzw=getattr(cfg.eke, "n2_over_dzw", False),
+            interface_active=_iface_act, active_3d=_is_act,
             T=T_eos, S=S_eos, p_cell=p_cell, eos_fn=eos_for_n2,
         ))
     if eke_int is None:
@@ -5673,6 +5680,8 @@ def compute_geometric_step_kappa(
     # Cell-centre thickness measure for the B_T depth integral (the same
     # metric assembly as compute_geometric_column_integrals).
     dz_actual = z_coord.dz_ref * jacobian[..., jnp.newaxis]
+    if _is_act is not None:
+        dz_actual = dz_actual * jnp.asarray(_is_act, dtype=dz_actual.dtype)
     return eke_int, kappa_gm, kappa_n, production_bc, L_eff, dz_actual
 
 

@@ -678,6 +678,8 @@ class DINOConfig:
     # need — Treguier is the faithful option. Lat-lon only (MPAS raises).
     gm_kappa_scheme: str = "visbeck"
     treguier_aei0: float = 1500.0  # Treguier κ cap [m²/s] = 0.5·rn_Ue·rn_Le (ldftra.F90:332)
+    geometric_alpha: float = 0.04  # GEOMETRIC eddy efficiency α (Torres et al. 2025 Eq. 6)
+    geometric_e0_per_depth: float = 1.0e-6  # GEOMETRIC cold-start ∫EKE dz / H [m²/s²]
     visbeck_alpha: float = 0.015   # Visbeck dimensionless prefactor
     visbeck_kappa_min: float = 200.0      # κ_GM floor [m²/s]
     visbeck_kappa_max: float = 2000.0     # κ_GM ceiling [m²/s]
@@ -3413,6 +3415,13 @@ def dino_lat_lon_state(
         T=Field(data=T, name="T", dims=state.T.dims, units=state.T.units),
         S=Field(data=S, name="S", dims=state.S.dims, units=state.S.units),
     )
+    if cfg.use_gm_redi and cfg.gm_kappa_scheme == "geometric":
+        eke0 = cfg.geometric_e0_per_depth * H_bathy * land_mask
+        state = state._replace(
+            eke=Field(
+                data=eke0, name="eke", dims=("lat", "lon"), units="m^3/s^2"
+            ),
+        )
     return state
 
 
@@ -3621,10 +3630,26 @@ def dino_lat_lon_model_config(
     from legoesm.ocean.physics.lateral_mixing.config import (
         GMRediConfig, VisbeckConfig,
     )
-    if cfg.gm_kappa_scheme not in ("visbeck", "treguier"):
+    from legoesm.ocean.physics.lateral_mixing.eke import (
+        EKEConfig, GeometricConfig, validate_eke_config,
+    )
+    if cfg.gm_kappa_scheme not in ("visbeck", "treguier", "geometric"):
         raise ValueError(
             f"unknown DINOConfig.gm_kappa_scheme {cfg.gm_kappa_scheme!r}; "
-            "expected 'visbeck' or 'treguier'")
+            "expected 'visbeck', 'treguier', or 'geometric'")
+    _eke_cfg = (
+        EKEConfig(
+            closure="geometric",
+            geometric=GeometricConfig(
+                alpha=cfg.geometric_alpha,
+                e0_per_depth=cfg.geometric_e0_per_depth,
+            ),
+        )
+        if (cfg.use_gm_redi and cfg.gm_kappa_scheme == "geometric")
+        else None
+    )
+    if _eke_cfg is not None:
+        validate_eke_config(_eke_cfg)
     if cfg.gm_redi_slope_n2 not in ("adiabatic", "nemo_bn2"):
         raise ValueError(
             "unknown DINOConfig.gm_redi_slope_n2 "
@@ -3827,6 +3852,7 @@ def dino_lat_lon_model_config(
                          and cfg.gm_kappa_scheme == "treguier"),
                 aei0=cfg.treguier_aei0,
             ),
+            eke=_eke_cfg,
         )
         # Fail at CONFIG BUILD, not on the first tendency: a non-finite or
         # non-positive --treguier-aei0 otherwise reaches the kernel and turns
@@ -3876,6 +3902,7 @@ def dino_lat_lon_model_config(
                 enabled=(cfg.gm_kappa_scheme == "treguier"),
                 aei0=cfg.treguier_aei0,
             ),
+            eke=_eke_cfg,
         ) if cfg.use_gm_redi else None
     if gm_redi_cfg is not None:
         # Same config-build guard as the lat-lon branch above.
@@ -4741,7 +4768,12 @@ def apply_dino_lat_lon_surface_forcing(state, forcing, z_coord, cfg, dt,
         restoring_surface_forcing,
     )
 
-    dz_0 = float(z_coord.dz_ref[0])
+    import jax as _jax
+    dz_0 = (
+        z_coord.dz_ref[0]
+        if isinstance(z_coord.dz_ref[0], _jax.core.Tracer)
+        else float(z_coord.dz_ref[0])
+    )
     cell_mask = state.land_mask.data
 
     # Oracle annual cycle (ln_ann_cyc): T* and Q_sr are TIME-DEPENDENT —
@@ -4940,7 +4972,12 @@ def apply_dino_mpas_surface_forcing(state, forcing, z_coord, cfg, dt,
             "DINO path only (seasonal T*/Q_sr recompute); the MPAS apply "
             "still uses the annual-mean arrays — reject rather than "
             "silently run the wrong forcing.")
-    dz_0 = float(z_coord.dz_ref[0])
+    import jax as _jax
+    dz_0 = (
+        z_coord.dz_ref[0]
+        if isinstance(z_coord.dz_ref[0], _jax.core.Tracer)
+        else float(z_coord.dz_ref[0])
+    )
     cell_mask = state.land_mask.data                  # (nCells,)
 
     # T tendency at top layer (eq 8)

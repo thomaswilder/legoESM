@@ -205,12 +205,26 @@ def _parse_args():
              "combination is rejected). Lat-lon only; MPAS is tracer-only.",
     )
     p.add_argument(
-        "--gm-kappa-scheme", choices=("visbeck", "treguier"), default=None,
+        "--gm-kappa-scheme", choices=("visbeck", "treguier", "geometric"),
+        default=None,
         help="Adaptive kappa_GM scaling (DINOConfig.gm_kappa_scheme): "
-             "'visbeck' (Visbeck 1997, historical default) or 'treguier' "
+             "'visbeck' (Visbeck 1997, historical default), 'treguier' "
              "(Treguier 1997 / NEMO nn_aei_ijk_t=21 — the DINO oracle "
-             "scaling, cap aei0=0.5*rn_Ue*rn_Le=1500 m2/s, ldftra.F90:332). "
-             "Lat-lon only.",
+             "scaling, cap aei0=0.5*rn_Ue*rn_Le=1500 m2/s, ldftra.F90:332), "
+             "or 'geometric' (Torres et al. 2025 / Marshall et al. 2012 "
+             "prognostic 2-D GEOMETRIC EKE closure). Lat-lon only.",
+    )
+    p.add_argument(
+        "--geometric-alpha", type=float, default=None,
+        help="GEOMETRIC eddy efficiency alpha (DINOConfig.geometric_alpha, "
+             "default 0.04; Torres et al. 2025 Eq. 6). Ignored unless "
+             "--gm-kappa-scheme geometric.",
+    )
+    p.add_argument(
+        "--n-barotropic-substeps", type=int, default=None,
+        help="Baroclinic-to-barotropic substep ratio "
+             "(DINOConfig.n_barotropic_substeps; e.g. 23 at 1 deg dt=2700s, "
+             "25 at 1/4 deg dt=720s).",
     )
     p.add_argument(
         "--gm-redi-mld-criterion", choices=("rho_c", "n2_integral"),
@@ -471,6 +485,8 @@ def _save_snapshot(state, t_seconds, snapshot_dir: Path, idx: int, grid_kind: st
     }
     if grid_kind == "latlon":
         fields["v"] = np.asarray(state.v.data)
+    if getattr(state, "eke", None) is not None:
+        fields["eke"] = np.asarray(state.eke.data)
     np.savez_compressed(snapshot_dir / f"snapshot_{idx:05d}.npz", **fields)
 
 
@@ -622,6 +638,11 @@ def main():
             cfg, barotropic_coriolis_split=args.barotropic_coriolis_split)
     if args.gm_kappa_scheme is not None:
         cfg = dataclasses.replace(cfg, gm_kappa_scheme=args.gm_kappa_scheme)
+    if args.geometric_alpha is not None:
+        cfg = dataclasses.replace(cfg, geometric_alpha=args.geometric_alpha)
+    if args.n_barotropic_substeps is not None:
+        cfg = dataclasses.replace(
+            cfg, n_barotropic_substeps=args.n_barotropic_substeps)
     if args.gm_redi_mld_criterion is not None:
         cfg = dataclasses.replace(
             cfg, gm_redi_mld_criterion=args.gm_redi_mld_criterion)

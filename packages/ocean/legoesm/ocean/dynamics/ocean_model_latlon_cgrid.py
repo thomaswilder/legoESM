@@ -15642,12 +15642,22 @@ class LatLonCGridOceanModel:
                     lm[:, :, jnp.newaxis] > 0.5, e_min, 0.0,
                 ) * jnp.ones((1, 1, nlev - 1), dtype=lm.dtype)
                 eke_dims = ("lat", "lon", "level")
+                eke_units = "m^2/s^2"
+            elif gm_redi.eke.closure == "geometric":
+                eke0 = (
+                    gm_redi.eke.geometric.e0_per_depth
+                    * state.H_bathy.data
+                    * lm
+                )
+                eke_dims = ("lat", "lon")
+                eke_units = "m^3/s^2"
             else:
                 eke0 = e_min * lm
                 eke_dims = ("lat", "lon")
+                eke_units = "m^2/s^2"
             state = state._replace(
                 eke=Field(data=eke0, name="eke", dims=eke_dims,
-                          units="m^2/s^2"))
+                          units=eke_units))
             # The 3-D EKE step also writes state.eke_diss (Veros eke_diss_iw) every
             # step; seed it to zero here so the None -> Field transition never
             # happens mid-scan (breaks the constant-pytree carry). Only the 3-D

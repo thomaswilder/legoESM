@@ -775,6 +775,8 @@ def compute_geometric_column_integrals(
     *,
     n2_mode: str = "insitu",
     n2_over_dzw: bool = False,
+    interface_active: jnp.ndarray | None = None,
+    active_3d: jnp.ndarray | None = None,
     T: jnp.ndarray | None = None,
     S: jnp.ndarray | None = None,
     p_cell: jnp.ndarray | None = None,
@@ -808,13 +810,19 @@ def compute_geometric_column_integrals(
     _sigma_bar, _L, wet_col, int_N_dz, sigma, _dzh = _eady_growth_and_length(
         rho, S_x, S_y, z_coord, jacobian, f_coriolis, visbeck_cfg, rho_ref, g,
         n2_mode=n2_mode, n2_over_dzw=n2_over_dzw,
+        interface_active=interface_active,
         T=T, S=S, p_cell=p_cell, eos_fn=eos_fn,
     )
     # Interface thickness weights — the same metric assembly as
     # _eady_growth_and_length (dz at centres from the z* Jacobian; half-sums
     # at the interior interfaces).
     dz_actual = z_coord.dz_ref * jacobian[..., jnp.newaxis]
-    dz_half = 0.5 * (dz_actual[..., :-1] + dz_actual[..., 1:])
+    if active_3d is not None:
+        dz_actual = dz_actual * jnp.asarray(active_3d, dtype=dz_actual.dtype)
+    dz_half = (
+        _dzh if interface_active is not None
+        else 0.5 * (dz_actual[..., :-1] + dz_actual[..., 1:])
+    )
     int_sigma_dz = jnp.where(wet_col, jnp.sum(sigma * dz_half, axis=-1), 0.0)
     int_sigma2_dz = jnp.where(
         wet_col, jnp.sum(sigma ** 2 * dz_half, axis=-1), 0.0)

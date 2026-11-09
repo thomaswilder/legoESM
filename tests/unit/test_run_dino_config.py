@@ -612,3 +612,15 @@ def test_nemo_fidelity_run_forces_fp64_policy(monkeypatch):
         assert get_policy().storage == PrecisionPolicy.fp64().storage
     finally:
         set_policy(_prior)
+
+
+def test_r4_geometric_config_flags_parse(monkeypatch):
+    """The R4 card and GEOMETRIC / substep flags parse cleanly."""
+    y = _REPO / "scripts" / "experiment" / "dino" / "nemo_faithful_kamm_mlf_r4.yaml"
+    monkeypatch.setattr(sys, "argv", ["run_dino", "--config", str(y)])
+    args = rd._parse_args()
+    assert args.nemo_resolution == "R4"
+    assert args.dt == 720.0
+    assert args.n_barotropic_substeps == 25
+    assert args.gm_kappa_scheme == "geometric"
+    assert args.geometric_alpha == 0.04
