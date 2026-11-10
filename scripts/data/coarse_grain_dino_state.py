@@ -1,4 +1,4 @@
-"""Coarse-grain daily 1/16 deg DINO (NEMO) T, S and SSH onto the 1/4 deg mesh.
+"""Coarse-grain daily 1/16 deg DINO (NEMO) T, S and SSH onto the 1/4 or 1 deg mesh.
 
 Track B of ``markdown-notes/coarse_graining_full_domain_plan.md`` (group B1):
 the coarse states that start and score the legoESM online training windows.
@@ -14,8 +14,8 @@ Method (decided by the user; plan D5, D6, D14, D17, D18):
 * wet coarse cell: ``T_c = R(T_f * m_f) / R(m_f)`` with ``R`` the regrid and
   ``m_f`` the fine wet mask of that level, i.e. the mean over the fine wet area
   under the cell.  ``R(m_f)`` is the coverage field written alongside.  The
-  coarse ring columns (only a quarter covered by fine cells) thus take the
-  mean of the covered quarter.
+  coarse ring columns (only partly covered by fine cells: 1/4 of their width
+  at 1/4 deg, 1/16 at 1 deg) thus take the mean of the covered part.
 * wet coarse cell with no wet fine cell beneath (deep, on the bowl slope):
   copy the value from the level above in the same column.
 * dry coarse cell: exactly 0.
@@ -45,6 +45,13 @@ from legoesm.io.git_provenance import git_provenance
 
 # NEMO variables coarse-grained here: name -> number of spatial dims.
 _STATE_VARS = {"thetao": 3, "so": 3, "zos": 2}
+
+# Coarse meshes this script knows, by zonal F-point spacing (deg): file tag, label.
+_COARSE_GRIDS = {0.25: ("cg025", "1/4 deg"), 1.0: ("cg1deg", "1 deg")}
+
+# The 1/16 and 1 deg vertical ladders differ by round-off only (max 1.05e-10 m,
+# in e3t_0); the 1/16 and 1/4 deg ones are identical.
+_VERTICAL_ATOL_M = 1e-9
 
 
 # --------------------------------------------------------------------------
@@ -102,11 +109,23 @@ def regrid(field: np.ndarray, weights) -> np.ndarray:
 def assert_same_vertical_grid(fine: dict, coarse: dict) -> None:
     """Both meshes must share one horizontally uniform vertical ladder.
 
-    Per-level area weights equal volume weights only then (plan, B1).
+    Per-level area weights equal volume weights only then (plan, B1).  Equal
+    means within ``_VERTICAL_ATOL_M`` metres at every level.
     """
     for name in ("e3t_1d", "gdept_1d", "e3t_0"):
-        if not np.array_equal(fine[name], coarse[name]):
+        a, b = fine[name], coarse[name]
+        if a.shape != b.shape or not np.allclose(a, b, rtol=0.0, atol=_VERTICAL_ATOL_M):
             raise ValueError(f"{name} differs between the fine and coarse meshes")
+
+
+def coarse_grid(glamf) -> tuple[str, str]:
+    """(file tag, label) of the coarse mesh, from its zonal F-point spacing."""
+    dlon = float(glamf[0, 1] - glamf[0, 0])
+    for step, grid in _COARSE_GRIDS.items():
+        if abs(dlon - step) < 1e-9:
+            return grid
+    raise ValueError(f"no output tag for a coarse mesh with zonal spacing {dlon} deg "
+                     f"(known: {sorted(_COARSE_GRIDS)})")
 
 
 # --------------------------------------------------------------------------
@@ -273,17 +292,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--fine-mesh", type=Path, required=True,
                    help="1/16 deg mesh_mask (EXP16/mesh_mask_exp16.nc)")
     p.add_argument("--coarse-mesh", type=Path, required=True,
-                   help="1/4 deg mesh_mask (EXP4/mesh_mask_025.nc)")
+                   help="1/4 or 1 deg mesh_mask (EXP4/mesh_mask_025.nc, mesh_mask_1deg.nc)")
     p.add_argument("--out-dir", type=Path, required=True)
     p.add_argument("--days", type=int, default=None,
                    help="process only the first N days (default: whole file)")
     return p
 
 
-def output_name(grid_t: Path) -> str:
+def output_name(grid_t: Path, tag: str) -> str:
     if "grid_T" not in grid_t.name:
         raise ValueError(f"{grid_t.name}: expected a *grid_T*.nc file")
-    return grid_t.name.replace("grid_T", "state_cg025")
+    return grid_t.name.replace("grid_T", f"state_{tag}")
 
 
 def main(argv=None) -> int:
@@ -311,10 +330,11 @@ def main(argv=None) -> int:
           f"min nonzero coverage {coverage[coverage > 0].min():.3e}", flush=True)
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = args.out_dir / output_name(args.grid_t)
+    tag, label = coarse_grid(coarse["glamf"])
+    out_path = args.out_dir / output_name(args.grid_t, tag)
     prov = git_provenance(__file__)
     attrs = dict(
-        title="DINO 1/16 deg T, S, SSH coarse-grained to the 1/4 deg mesh",
+        title=f"DINO 1/16 deg T, S, SSH coarse-grained to the {label} mesh",
         method=("unfiltered mask-aware area-conservative mean per level "
                 "(R(T*m)/R(m), compute_overlap_weights dstarea); wet coarse "
                 "cells with no wet fine cell copy the level above; dry cells 0"),

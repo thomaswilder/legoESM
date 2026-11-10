@@ -119,6 +119,23 @@ def test_rectilinear_axes_rejects_curvilinear():
         cg.rectilinear_axes(lam, phi)
 
 
+def test_vertical_grid_tolerates_round_off_only(pair):
+    f, _, _, _ = pair
+    near = {k: f[k] + 1e-10 for k in ("e3t_1d", "gdept_1d", "e3t_0")}
+    cg.assert_same_vertical_grid(f, near)     # 1/16 vs 1 deg: 1.05e-10 m
+    far = dict(near, e3t_0=f["e3t_0"] + 1e-8)
+    with pytest.raises(ValueError, match="e3t_0"):
+        cg.assert_same_vertical_grid(f, far)
+
+
+def test_coarse_grid_tag(pair):
+    f, c, _, _ = pair
+    assert cg.coarse_grid(f["glamf"]) == ("cg025", "1/4 deg")   # R4 mesh
+    assert cg.coarse_grid(c["glamf"]) == ("cg1deg", "1 deg")    # R1 mesh
+    with pytest.raises(ValueError, match="zonal spacing"):
+        cg.coarse_grid(f["glamf"] * 2.0)
+
+
 def _write_mesh(path, m):
     nz, ny, nx = m["tmask"].shape
     with netCDF4.Dataset(path, "w") as d:
@@ -162,7 +179,7 @@ def test_main_writes_month_file(pair, tmp_path):
                   "--coarse-mesh", str(tmp_path / "coarse_mesh.nc"),
                   "--out-dir", str(tmp_path / "out"), "--days", "1"])
     assert rc == 0
-    with netCDF4.Dataset(tmp_path / "out" / "MINT_1d_00610101_00610102_state_cg025.nc") as o:
+    with netCDF4.Dataset(tmp_path / "out" / "MINT_1d_00610101_00610102_state_cg1deg.nc") as o:
         assert o["thetao"].shape == (1,) + c["tmask"].shape
         assert o["zos"].shape == (1,) + c["tmask"].shape[1:]
         assert o["thetao"].dtype == np.float32
@@ -173,3 +190,4 @@ def test_main_writes_month_file(pair, tmp_path):
         assert o["time_counter"].calendar == "360_day"
         assert o["coverage"].shape == c["tmask"].shape
         assert o.legoesm_git_commit
+        assert o.title.endswith("to the 1 deg mesh")
