@@ -4915,7 +4915,7 @@ def apply_dino_lat_lon_surface_forcing(state, forcing, z_coord, cfg, dt,
         new_u = state.u.data.at[..., 0].set(new_u_top)
 
     state_u = state._replace(
-        u=Field(data=new_u, name=state.u.name, dims=state.u.dims, units=state.u.units),
+        u=state.u.replace(data=new_u),
     )
     if return_rate:
         return state_u, (dT_dt_restoring, dS_dt_col)
@@ -4923,8 +4923,8 @@ def apply_dino_lat_lon_surface_forcing(state, forcing, z_coord, cfg, dt,
     new_T = state.T.data + dt * dT_dt_restoring
     new_S = state.S.data + dt * dS_dt_col
     return state_u._replace(
-        T=Field(data=new_T, name=state.T.name, dims=state.T.dims, units=state.T.units),
-        S=Field(data=new_S, name=state.S.name, dims=state.S.dims, units=state.S.units),
+        T=state.T.replace(data=new_T),
+        S=state.S.replace(data=new_S),
     )
 
 
@@ -5030,7 +5030,7 @@ def apply_dino_mpas_surface_forcing(state, forcing, z_coord, cfg, dt,
     new_u = state.u.data.at[:, 0].set(new_u_top)
 
     return state._replace(
-        T=Field(data=new_T, name=state.T.name, dims=state.T.dims, units=state.T.units),
-        S=Field(data=new_S, name=state.S.name, dims=state.S.dims, units=state.S.units),
-        u=Field(data=new_u, name=state.u.name, dims=state.u.dims, units=state.u.units),
+        T=state.T.replace(data=new_T),
+        S=state.S.replace(data=new_S),
+        u=state.u.replace(data=new_u),
     )

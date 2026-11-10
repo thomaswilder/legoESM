@@ -2575,6 +2575,27 @@ class TestSurfaceFluxDivisor:
         with pytest.raises(ValueError, match="surface_flux_divisor"):
             apply_dino_lat_lon_surface_forcing(st, frc, z, cfg, 2700.0)
 
+    def test_forcing_keeps_field_metadata(self):
+        """u is edge-staggered; a rebuilt Field that drops staggering changes
+        the state's pytree, which breaks a lax.scan over the driver step."""
+        import jax
+        from legoesm.ocean.experiments.dino import (
+            apply_dino_lat_lon_surface_forcing,
+        )
+        cfg = DINOConfig()
+        g, z, st, frc = self._fixture(0.0, cfg)
+        assert st.u.staggering == "edge"
+        out = apply_dino_lat_lon_surface_forcing(st, frc, z, cfg, 2700.0)
+        import dataclasses
+        cfg_rate = dataclasses.replace(
+            cfg, surface_tendency_placement="leapfrog_rhs")
+        out_rate, _ = apply_dino_lat_lon_surface_forcing(
+            st, frc, z, cfg_rate, 2700.0, return_rate=True)
+        assert jax.tree_util.tree_structure(out) == \
+            jax.tree_util.tree_structure(st)
+        assert jax.tree_util.tree_structure(out_rate) == \
+            jax.tree_util.tree_structure(st)
+
     def test_static_is_bit_identical_to_legacy(self):
         """Fallback path (default / no live-divisor opt-in): byte-identical
         to the pre-fix behaviour at every eta, since dz_0_live == dz_0
