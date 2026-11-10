@@ -37,25 +37,50 @@ def _load_run_dino():
     return rd
 
 
-def alpha_gradient_check(run_dino_argv, n_steps=2, eps_rel=1.0e-4, seed=0):
+def alpha_gradient_check(run_dino_argv, n_steps=2, eps_rel=1.0e-4, seed=0,
+                         n_devices=1):
     """Return a dict with alpha, L, AD dL/dalpha, FD at eps and eps/10, and
     wall times. ``run_dino_argv`` is parsed by run_dino's own parser. Runs
     under the fp64 precision policy (restored afterwards): a float32 state
-    cannot resolve the FD difference. The NEMO cards force fp64 anyway."""
+    cannot resolve the FD difference. The NEMO cards force fp64 anyway.
+    ``n_devices > 1`` splits the initial state along longitude over that many
+    devices and lets XLA partition the step (no model change)."""
     from legoesm.core.precision import PrecisionPolicy, get_policy, set_policy
 
     prior = get_policy()
     set_policy(PrecisionPolicy.fp64())
     try:
-        return _check(run_dino_argv, n_steps, eps_rel, seed)
+        return _check(run_dino_argv, n_steps, eps_rel, seed, n_devices)
     finally:
         set_policy(prior)
 
 
-def _check(run_dino_argv, n_steps, eps_rel, seed):
+def _split_along_longitude(state, n_devices):
+    """Shard every leaf whose axis 1 is the longitude axis of T (n_lat, n_lon,
+    nz); replicate the rest. The repo's lat-lon sharders split latitude, and
+    the 1/4 deg DINO mesh has 797 rows (prime)."""
+    import jax
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+    n_lon = state.T.data.shape[1]
+    if n_lon % n_devices:
+        raise SystemExit(f"{n_lon} longitude columns do not split evenly "
+                         f"over {n_devices} devices")
+    mesh = Mesh(np.array(jax.devices()[:n_devices]), ("lon",))
+    lon, rep = NamedSharding(mesh, P(None, "lon")), NamedSharding(mesh, P())
+    return jax.tree_util.tree_map(
+        lambda a: jax.device_put(
+            a, lon if a.ndim >= 2 and a.shape[1] == n_lon else rep)
+        if isinstance(a, jax.Array) else a, state)
+
+
+def _check(run_dino_argv, n_steps, eps_rel, seed, n_devices=1):
     import jax
     import jax.numpy as jnp
 
+    if n_devices > len(jax.devices()):
+        raise SystemExit(f"--n-devices {n_devices} but JAX sees "
+                         f"{len(jax.devices())}: {jax.devices()}")
     rd = _load_run_dino()
     saved_argv = sys.argv
     sys.argv = ["run_dino", *run_dino_argv]
@@ -69,6 +94,8 @@ def _check(run_dino_argv, n_steps, eps_rel, seed):
         raise SystemExit("needs the GEOMETRIC closure (--gm-kappa-scheme "
                          "geometric, or a card that selects it)")
     alpha0 = float(gm.eke.geometric.alpha)
+    if n_devices > 1:
+        run.state = _split_along_longitude(run.state, n_devices)
 
     rng = np.random.default_rng(seed)
     w_T = jnp.asarray(rng.standard_normal(run.state.T.data.shape))
@@ -92,6 +119,9 @@ def _check(run_dino_argv, n_steps, eps_rel, seed):
     L, dL = jax.value_and_grad(loss)(jnp.asarray(alpha0))
     dL = float(jax.block_until_ready(dL))
     t_grad = time.time() - t0
+    # Peak after the gradient, before the (smaller) FD forward runs; None on CPU.
+    peak = [(d.memory_stats() or {}).get("peak_bytes_in_use")
+            for d in jax.devices()[:n_devices]]
 
     # alpha as a jit input: one compile serves all four FD evaluations.
     loss_jit = jax.jit(loss)
@@ -103,7 +133,8 @@ def _check(run_dino_argv, n_steps, eps_rel, seed):
     t_fd = time.time() - t0
     return {"alpha": alpha0, "L": float(L), "ad": dL, "fd": fd,
             "steps": n_steps, "t_grad_s": t_grad, "t_fd_s": t_fd,
-            "dt": run.dt, "grid": run.grid_desc}
+            "dt": run.dt, "grid": run.grid_desc, "n_devices": n_devices,
+            "peak_bytes": peak}
 
 
 def main():
@@ -111,6 +142,7 @@ def main():
     p.add_argument("--steps", type=int, default=2)
     p.add_argument("--eps-rel", type=float, default=1.0e-4)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--n-devices", type=int, default=1)
     own, rest = p.parse_known_args()
 
     import jax
@@ -124,9 +156,13 @@ def main():
           f"devices={jax.devices()}")
     print(f"argv: {sys.argv[1:]}")
 
-    r = alpha_gradient_check(rest, own.steps, own.eps_rel, own.seed)
+    r = alpha_gradient_check(rest, own.steps, own.eps_rel, own.seed,
+                             own.n_devices)
     print(f"{r['grid']}, dt={r['dt']} s, {r['steps']} steps, "
-          f"alpha={r['alpha']}")
+          f"alpha={r['alpha']}, {r['n_devices']} device(s)")
+    print("peak memory after grad per device: "
+          + ", ".join("n/a" if b is None else f"{b / 2**30:.2f} GiB"
+                      for b in r["peak_bytes"]))
     print(f"L = {r['L']:.17e}")
     print(f"AD dL/dalpha = {r['ad']:.10e}   ({r['t_grad_s']:.1f} s)")
     for e, v in r["fd"].items():
