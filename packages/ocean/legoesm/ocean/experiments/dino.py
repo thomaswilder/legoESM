@@ -86,6 +86,12 @@ class DINOConfig:
     # nemo_dino_mesh.NEMO_DINO_NAMELISTS ("R1" = 1 deg 52x199, "R4" = 1/4 deg
     # 202x797). Not read off that path.
     nemo_resolution: str = "R1"
+    # Which NEMO build's re-entrant-channel rows that mesh opens: a key of
+    # nemo_dino_mesh.NEMO_DINO_CHANNEL_ROWS. "nemo502" = NEMO 5.0.2, the build
+    # every certified DINO twin uses (1 deg rows 14..48); "ai4pex" = the AI4PEX
+    # NEMO build that wrote the training data (one row south, 13..47). Moves
+    # the land/face masks only. Not read off the nemo_faithful_grid path.
+    nemo_channel_rows: str = "nemo502"
     channel_lat_south_deg: float = -65.0  # southern edge of re-entrant channel
     channel_lat_north_deg: float = -45.0  # northern edge of re-entrant channel
     channel_width_deg: float = 20.0       # Δφ_c in eq A4 (= |lat_n - lat_s|)
@@ -2786,7 +2792,8 @@ def dino_lat_lon_vertical(grid, cfg: DINOConfig | None = None):
                 "nemo_faithful_grid=True builds a masked full-step staircase "
                 f"and needs vertical_coordinate='masked_zco'; got "
                 f"{cfg.vertical_coordinate!r}.")
-        return nemo_faithful_dino_domain(cfg.nemo_resolution).z_coord
+        return nemo_faithful_dino_domain(
+            cfg.nemo_resolution, cfg.nemo_channel_rows).z_coord
     z_ref = create_dino_z_star(cfg)
     if cfg.vertical_coordinate == "zstar":
         return z_ref
@@ -2992,7 +2999,8 @@ def nemo_faithful_dino_config(base: DINOConfig | None = None) -> DINOConfig:
     )
 
 
-def nemo_faithful_dino_domain(resolution: str = "R1"):
+def nemo_faithful_dino_domain(resolution: str = "R1",
+                              channel_rows: str = "nemo502"):
     """See :func:`_nemo_faithful_dino_domain`; keyed on the precision policy.
 
     The cache MUST be keyed on the storage dtype: the bridge builds its arrays
@@ -3001,11 +3009,12 @@ def nemo_faithful_dino_domain(resolution: str = "R1"):
     fp64 (or the reverse) -- silently, and with the two never comparable.
     """
     from legoesm.core.precision import get_policy
-    return _nemo_faithful_dino_domain(get_policy().storage, resolution)
+    return _nemo_faithful_dino_domain(get_policy().storage, resolution,
+                                      channel_rows)
 
 
 @_lru_cache(maxsize=4)
-def _nemo_faithful_dino_domain(_storage_dtype, resolution):
+def _nemo_faithful_dino_domain(_storage_dtype, resolution, channel_rows):
     """NEMO's DINO domain (geometry, vertical coordinate, land mask), analytic.
 
     Builds NEMO's mesh from its own namelist with
@@ -3053,7 +3062,7 @@ def _nemo_faithful_dino_domain(_storage_dtype, resolution):
             "PrecisionPolicy.fp64()) before building it. run_dino.py does "
             "this for you on every NEMO-fidelity run.")
 
-    g = nemo_dino_mesh(nemo_dino_namelist(resolution))
+    g = nemo_dino_mesh(nemo_dino_namelist(resolution), channel_rows)
     # The bridge carries a prognostic state across as well; this path starts
     # FROM REST and dino_lat_lon_state replaces T/S/u/v/eta wholesale, so a
     # zero state is both sufficient and honest here.  (Passing the analytic
@@ -3125,7 +3134,8 @@ def dino_lat_lon_grid(cfg: DINOConfig | None = None, n_lon: int = 50):
                 "nemo_faithful_dino_config() so the bathymetry frame + sill "
                 "anchor are co-set."
             )
-        br = nemo_faithful_dino_domain(cfg.nemo_resolution)
+        br = nemo_faithful_dino_domain(cfg.nemo_resolution,
+                                       cfg.nemo_channel_rows)
         geom = br.geometry
         # The mesh comes from NEMO's namelist, not from cfg, so a cfg field
         # that WOULD have shaped the old create_mercator_grid call must be
@@ -3208,7 +3218,7 @@ def _nemo_dino_domain_for(grid, z_coord, land_mask, cfg):
     _n_lon, _n_lat, jpk = nemo_dino_domain_size(nml)
     if int(z_coord.n_levels) != jpk:
         return None
-    g = nemo_dino_mesh(nml)
+    g = nemo_dino_mesh(nml, cfg.nemo_channel_rows)
     # The VERTICAL LADDER, not just the level count: NEMO's initial profile is
     # evaluated at NEMO's gdept_0, so a run whose cells are a different size is
     # a different experiment even at the same n_levels (a reviewer halved
@@ -3288,7 +3298,7 @@ def dino_lat_lon_initial_state_arrays(
         # exactly the mismatch between the standalone path and every certified
         # twin that this branch removes.
         land_mask_override = nemo_faithful_dino_domain(
-            cfg.nemo_resolution).land_mask
+            cfg.nemo_resolution, cfg.nemo_channel_rows).land_mask
 
     lat_deg_1d = jnp.degrees(grid.lat)                        # (n_lat,)
 

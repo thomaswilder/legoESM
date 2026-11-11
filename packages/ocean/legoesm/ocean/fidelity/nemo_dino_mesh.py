@@ -124,12 +124,25 @@ NEMO_DINO_R1 = NemoDinoNamelist(
 )
 
 #: DINO at 1/4 deg: R1 with only the resolution changed.  NEMO's DINO repo
-#: (vopikamm/DINO v0.2.0) ships no 1/4 deg namelist and has no 1/4 deg mesh to
-#: check against; the other grid values may need updating once checked.
+#: (vopikamm/DINO v0.2.0) ships no 1/4 deg namelist.  The AI4PEX NEMO build's
+#: 1/4 deg mesh_mask (``.../NEMO_data/DINO/EXP4/mesh_mask_025.nc`` on JASMIN)
+#: has tmask/umask/vmask/fmask equal to this namelist's with
+#: ``channel_rows="ai4pex"`` (0 differing cells, measured 2026-11-11).
 NEMO_DINO_R4 = NEMO_DINO_R1._replace(rn_e1_deg=0.25)
 
 #: The DINO meshes a run can name (``DINOConfig.nemo_resolution``).
 NEMO_DINO_NAMELISTS = {"R1": NEMO_DINO_R1, "R4": NEMO_DINO_R4}
+
+#: Which NEMO build's re-entrant-channel rows the land ring opens
+#: (``DINOConfig.nemo_channel_rows``), as the number of rows the opening sits
+#: SOUTH of NEMO 5.0.2's.  ``"nemo502"`` is the build every certified DINO
+#: twin uses (1 deg rows 14..48, 0-based).  ``"ai4pex"`` is the AI4PEX NEMO
+#: build that wrote the training data: MEASURED one row south at every
+#: resolution on disk (1 deg 13..47, 1/4 deg 53..194, 1/16 deg 210..781;
+#: mesh_mask_1deg.nc, EXP4/mesh_mask_025.nc, EXP16/mesh_mask_exp16.nc).  That
+#: build's Fortran is not on disk, so the cause of the offset is not
+#: transcribed -- only its measured effect, which is the whole mask difference.
+NEMO_DINO_CHANNEL_ROWS = {"nemo502": 0, "ai4pex": 1}
 
 
 def nemo_dino_namelist(name: str) -> NemoDinoNamelist:
@@ -318,8 +331,13 @@ def _gauss_ring(dist, lam0, phi0, prad, lam, phi, dep_top, dep_bot):
 # the mesh
 # ---------------------------------------------------------------------------
 
-def nemo_dino_mesh(nml: NemoDinoNamelist = NEMO_DINO_R1) -> NemoGrid:
+def nemo_dino_mesh(nml: NemoDinoNamelist = NEMO_DINO_R1,
+                   channel_rows: str = "nemo502") -> NemoGrid:
     """Build NEMO's DINO mesh analytically as a :class:`NemoGrid`.
+
+    ``channel_rows`` (a key of :data:`NEMO_DINO_CHANNEL_ROWS`) picks which
+    NEMO build's re-entrant-channel rows the land ring opens; it moves
+    tmask/umask/vmask/fmask (and so hu_0/hv_0) and nothing else.
 
     Field-for-field equivalent to ``read_nemo_mesh_mask(mesh_mask.nc,
     nn_hls=0)`` on the run this namelist describes, so the result can be
@@ -364,7 +382,8 @@ def nemo_dino_mesh(nml: NemoDinoNamelist = NEMO_DINO_R1) -> NemoGrid:
     n_lat, n_lon = hgr["gphit"].shape
     jpk = nml.nn_k
     lad = vertical_ladders(nml, jpk)
-    bathy, k_top, k_bot = nemo_dino_bathymetry(nml, hgr, lad["gdept_1d"])
+    bathy, k_top, k_bot = nemo_dino_bathymetry(nml, hgr, lad["gdept_1d"],
+                                               channel_rows)
 
     # --- dommsk.F90:120-153 ----------------------------------------------
     kk = np.arange(1, jpk + 1)[None, None, :]
@@ -474,7 +493,8 @@ def nemo_dino_hgr(nml: NemoDinoNamelist = NEMO_DINO_R1) -> dict:
     )
 
 
-def nemo_dino_bathymetry(nml: NemoDinoNamelist, hgr: dict, gdept_1d):
+def nemo_dino_bathymetry(nml: NemoDinoNamelist, hgr: dict, gdept_1d,
+                         channel_rows: str = "nemo502"):
     """Bowl + Drake sill, and the resulting ``k_top``/``k_bot``.
 
     usrdef_zgr.F90:174-400 (``zgr_bat``), :438-484 (``zgr_msk_top_bot``),
@@ -486,6 +506,10 @@ def nemo_dino_bathymetry(nml: NemoDinoNamelist, hgr: dict, gdept_1d):
     (domzgr.F90:315), which is why ``mbathy`` stays at the bathymetric level
     on the first and last rows while ``tmask`` there is zero.
     """
+    if channel_rows not in NEMO_DINO_CHANNEL_ROWS:
+        raise ValueError(
+            f"unknown NEMO DINO channel_rows variant {channel_rows!r}; choose "
+            f"from {sorted(NEMO_DINO_CHANNEL_ROWS)}")
     lam_t, phi_t, phi_v = hgr["lam_t"], hgr["phi_t"], hgr["phi_v"]
     lam_u = hgr["lam_u"]
     n_lat, n_lon = len(phi_t), len(lam_t)
@@ -560,8 +584,10 @@ def nemo_dino_bathymetry(nml: NemoDinoNamelist, hgr: dict, gdept_1d):
     k_top = np.minimum(1, k_bot)
 
     # --- i-periodic land ring (usrdef_zgr.F90:150-163) -------------------
-    nn_cha_min = jeq_s - merc_proj(nml.rn_cha_min, e1deg) + 1
-    nn_cha_max = jeq_s - merc_proj(nml.rn_cha_max, e1deg) + 1
+    # The build offset moves both edges together (NEMO_DINO_CHANNEL_ROWS).
+    shift = NEMO_DINO_CHANNEL_ROWS[channel_rows]
+    nn_cha_min = jeq_s - merc_proj(nml.rn_cha_min, e1deg) + 1 - shift
+    nn_cha_max = jeq_s - merc_proj(nml.rn_cha_max, e1deg) + 1 - shift
     jg = np.arange(1, n_lat + 1)
     walled = (jg <= nn_cha_min) | (jg >= nn_cha_max)      # (n_lat,)
     ring = np.ones((n_lat, n_lon), dtype=np.int64)
@@ -689,7 +715,7 @@ def nemo_dino_istate(g: NemoGrid, nn_initcase: int = 4):
 
 __all__ = (
     "NemoDinoNamelist", "NEMO_DINO_R1", "NEMO_DINO_R4", "NEMO_DINO_NAMELISTS",
-    "nemo_dino_namelist", "merc_proj", "nemo_dino_domain_size",
+    "NEMO_DINO_CHANNEL_ROWS", "nemo_dino_namelist", "merc_proj", "nemo_dino_domain_size",
     "mi96_1d", "depth_to_e3_1d", "e3_to_depth_1d", "vertical_ladders",
     "nemo_dino_hgr", "nemo_dino_bathymetry", "nemo_dino_mesh",
     "nemo_dino_istate",

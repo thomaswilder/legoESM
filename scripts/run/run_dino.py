@@ -53,7 +53,8 @@ import numpy as np
 from legoesm.grids.voronoi import create_regional_voronoi_mesh
 from legoesm.ocean.dynamics.ocean_model_latlon_cgrid import LatLonCGridOceanModel
 from legoesm.ocean.dynamics.ocean_model_mpas import MPASOceanModel
-from legoesm.ocean.fidelity.nemo_dino_mesh import NEMO_DINO_NAMELISTS
+from legoesm.ocean.fidelity.nemo_dino_mesh import (
+    NEMO_DINO_CHANNEL_ROWS, NEMO_DINO_NAMELISTS)
 from legoesm.ocean.experiments.dino import (
     DINO_L2_RECIPES,
     DINO_RECIPES,
@@ -179,6 +180,15 @@ def _parse_args():
              "(DINOConfig.nemo_resolution): R1 = 1 deg 52x199 (default), "
              "R4 = 1/4 deg 202x797. Any mesh other than R1 also needs an "
              "explicit --dt.",
+    )
+    p.add_argument(
+        "--nemo-channel-rows", choices=sorted(NEMO_DINO_CHANNEL_ROWS),
+        default=None,
+        help="Which NEMO build's re-entrant-channel rows --nemo-faithful-grid "
+             "opens (DINOConfig.nemo_channel_rows): nemo502 = NEMO 5.0.2, the "
+             "certified-twin build (default; 1 deg rows 14..48); ai4pex = the "
+             "AI4PEX NEMO build that wrote the training data (one row south, "
+             "1 deg rows 13..47). Moves the land/face masks only.",
     )
     p.add_argument(
         "--tke-momentum-visc-bg", type=float, default=None,
@@ -691,6 +701,9 @@ def build_run(args):
     if args.nemo_resolution is not None and not args.nemo_faithful_grid:
         raise SystemExit(
             "--nemo-resolution only applies with --nemo-faithful-grid.")
+    if args.nemo_channel_rows is not None and not args.nemo_faithful_grid:
+        raise SystemExit(
+            "--nemo-channel-rows only applies with --nemo-faithful-grid.")
     if args.nemo_faithful_grid:
         if args.grid != "latlon":
             raise SystemExit(
@@ -704,6 +717,9 @@ def build_run(args):
                     "explicit --dt (the default is the 1 deg 2700 s).")
             cfg = dataclasses.replace(
                 cfg, nemo_resolution=args.nemo_resolution)
+        if args.nemo_channel_rows is not None:
+            cfg = dataclasses.replace(
+                cfg, nemo_channel_rows=args.nemo_channel_rows)
         # Applied LAST: co-sets the bathymetry lon frame + sill anchor onto
         # whatever recipe/overrides preceded it (must not be clobbered after).
         cfg = nemo_faithful_dino_config(base=cfg)

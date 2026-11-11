@@ -637,6 +637,31 @@ class TestNemoFaithfulInitialState:
             jnp.degrees(grid.lat), z.z_full_ref, cfg)
         assert np.abs(np.asarray(paper_T) - T[:, 0, :]).max() > 1e-3
 
+    def test_ai4pex_channel_rows_reach_the_domain_and_istate(self, nemo_fp64):
+        # DINOConfig.nemo_channel_rows must reach every mesh build: the land
+        # mask, the vertical coordinate, AND the IC trigger's mesh (which
+        # compares the land mask cell-for-cell, so a nemo502 rebuild there
+        # would silently drop the run onto the paper profile).
+        from legoesm.ocean.fidelity.nemo_dino_mesh import (
+            nemo_dino_istate, nemo_dino_mesh)
+        cfg = nemo_faithful_dino_config(
+            base=dataclasses.replace(
+                dino_config_for_recipe("nemo_dino_kamm_mlf"),
+                nemo_channel_rows="ai4pex"))
+        grid = dino_lat_lon_grid(cfg)
+        z = dino.dino_lat_lon_vertical(grid, cfg)
+        st = dino.dino_lat_lon_state(grid, z, cfg)
+        g = nemo_dino_mesh(channel_rows="ai4pex")
+        wet = np.asarray(dino.nemo_faithful_dino_domain(
+            "R1", "ai4pex").land_mask) > 0.5
+        assert np.array_equal(wet, g.tmask[:, :, 0] > 0.5)
+        rows = np.nonzero(wet[:, 0])[0]
+        assert (rows.min(), rows.max()) == (13, 47)
+        assert np.array_equal(np.asarray(z.is_active), g.tmask > 0.5)
+        T, S = nemo_dino_istate(g)
+        assert np.array_equal(np.asarray(st.T.data), T)
+        assert np.array_equal(np.asarray(st.S.data), S)
+
     def test_a_non_nemo_domain_keeps_the_paper_profile(self):
         # Same card, ordinary Mercator grid: the analytic (lat, z) profile,
         # broadcast over longitude, exactly as before.

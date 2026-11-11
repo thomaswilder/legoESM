@@ -73,6 +73,52 @@ def test_land_ring_is_the_partial_periodic_channel():
     assert surf[1:-1, 1:-1].all()
 
 
+# Wet rows (0-based, inclusive) of the two ring columns in the AI4PEX NEMO
+# build's DINO meshes, read off tmask[0, :, 0] and tmask[0, :, -1] of
+# /gws/ssde/j25b/ai4pex/twilder/NEMO_data/DINO/mesh_mask_1deg.nc (R1) and
+# .../DINO/EXP4/mesh_mask_025.nc (R4) on JASMIN, 2026-11-11.  Pinned here
+# because CI has no NEMO files; full 3-D tmask/umask/vmask/fmask equality
+# against those files was checked offline (0 differing cells, R1 and R4).
+_AI4PEX_CHANNEL_ROWS = {"R1": (13, 47), "R4": (53, 194)}
+# NEMO 5.0.2 (certified twins): R1 14..48 as pinned above; R4 by the same rule.
+_NEMO502_CHANNEL_ROWS = {"R1": (14, 48), "R4": (54, 195)}
+
+
+@pytest.mark.parametrize("res", ["R1", "R4"])
+@pytest.mark.parametrize("rows,expected", [
+    ("nemo502", _NEMO502_CHANNEL_ROWS), ("ai4pex", _AI4PEX_CHANNEL_ROWS)])
+def test_channel_rows_select_the_builds_ring(res, rows, expected):
+    nml = ndm.nemo_dino_namelist(res)
+    g = ndm.nemo_dino_mesh(nml, channel_rows=rows)
+    surf = g.tmask[:, :, 0] > 0.5
+    lo, hi = expected[res]
+    for col in (0, -1):
+        wet_rows = np.nonzero(surf[:, col])[0]
+        assert (wet_rows.min(), wet_rows.max()) == (lo, hi)
+        assert wet_rows.size == hi - lo + 1
+    assert surf[1:-1, 1:-1].all()
+
+
+def test_channel_rows_default_is_nemo502_and_moves_only_masks():
+    base = ndm.nemo_dino_mesh()
+    assert np.array_equal(
+        base.tmask, ndm.nemo_dino_mesh(channel_rows="nemo502").tmask)
+    ai = ndm.nemo_dino_mesh(channel_rows="ai4pex")
+    moved = {"tmask", "umask", "vmask", "fmask", "hu_0", "hv_0"}
+    for f in base._fields:
+        a, b = getattr(base, f), getattr(ai, f)
+        if a is None:
+            assert b is None
+            continue
+        same = np.array_equal(np.asarray(a), np.asarray(b))
+        assert same == (f not in moved), f
+
+
+def test_channel_rows_unknown_value_raises():
+    with pytest.raises(ValueError, match="unknown NEMO DINO channel_rows"):
+        ndm.nemo_dino_mesh(channel_rows="nemo42")
+
+
 def test_masks_are_the_neighbour_products_nemo_builds():
     # dommsk.F90:150-151, with i wrapping (ln_Iperio) and j closed.
     g = ndm.nemo_dino_mesh()

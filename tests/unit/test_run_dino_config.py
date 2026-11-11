@@ -632,3 +632,55 @@ def test_geometric_e0_per_depth_flag_parses_and_defaults_none(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["run_dino", "--geometric-e0-per-depth",
                                       "1e-3"])
     assert rd._parse_args().geometric_e0_per_depth == 1e-3
+
+
+class _CfgReachedError(Exception):
+    pass
+
+
+def _resolved_cfg(monkeypatch, argv):
+    """The DINOConfig main() hands to grid construction for ``argv``."""
+    from legoesm.core.precision import get_policy, set_policy
+    seen = {}
+
+    def _capture(cfg, *a, **k):
+        seen["cfg"] = cfg
+        raise _CfgReachedError
+    prev = get_policy()
+    monkeypatch.setattr(rd, "dino_lat_lon_grid", _capture)
+    monkeypatch.setattr(sys, "argv", ["run_dino", *argv])
+    try:
+        with pytest.raises(_CfgReachedError):
+            rd.main()
+    finally:
+        set_policy(prev)
+    return seen["cfg"]
+
+
+def test_nemo_channel_rows_flag_round_trips_to_config(tmp_path, monkeypatch):
+    base = ["--grid", "latlon", "--nemo-faithful-grid"]
+    assert _resolved_cfg(monkeypatch, base).nemo_channel_rows == "nemo502"
+    cfg = _resolved_cfg(monkeypatch, [*base, "--nemo-channel-rows", "ai4pex"])
+    assert cfg.nemo_channel_rows == "ai4pex"
+    # ...and from a YAML deck key (the loader maps keys onto argparse dests).
+    y = _write(tmp_path, "grid: latlon\nnemo_faithful_grid: true\n"
+                         "nemo_channel_rows: ai4pex\n")
+    assert _resolved_cfg(monkeypatch, ["--config", y]).nemo_channel_rows == \
+        "ai4pex"
+
+
+def test_nemo_channel_rows_flag_rejects_unknown_and_needs_faithful_grid(
+        monkeypatch):
+    monkeypatch.setattr(sys, "argv",
+                        ["run_dino", "--nemo-channel-rows", "nemo42"])
+    with pytest.raises(SystemExit):
+        rd._parse_args()
+    from legoesm.core.precision import get_policy, set_policy
+    prev = get_policy()
+    monkeypatch.setattr(sys, "argv",
+                        ["run_dino", "--nemo-channel-rows", "ai4pex"])
+    try:
+        with pytest.raises(SystemExit, match="only applies with"):
+            rd.main()
+    finally:
+        set_policy(prev)

@@ -367,6 +367,9 @@ BASELINE_DISPATCHERS: frozenset[tuple[str, str]] = frozenset(
         # (nemo_drag_r_from_speed_sq's internal legacy-rejection raise is not
         # scanner-shaped; the canonical unknown-scheme guard is the validator.)
         ("packages/ocean/legoesm/ocean/dynamics/ocean_tendency_common.py", "validate_bottom_drag_scheme"),
+        # DINO mesh channel_rows build variant (nemo502 | ai4pex): a typo
+        # would silently open the re-entrant channel on the wrong rows.
+        ("packages/ocean/legoesm/ocean/fidelity/nemo_dino_mesh.py", "nemo_dino_bathymetry"),
         ("packages/ocean/legoesm/ocean/eos.py", "make_eos_fn"),
         ("packages/ocean/legoesm/ocean/eos.py", "freezing_point"),
         ("packages/ocean/legoesm/ocean/experiments/dino.py", "create_forcings"),
