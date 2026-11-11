@@ -147,7 +147,7 @@ def preprocess(vor, mask):
     return a[..., None]
 
 
-def wall_fill_index(mask, halo: int):
+def wall_fill_index(mask, halo: int, *, pad_ns: bool):
     """Gather indices that reproduce ``ml_models.fill_reflect_about_wall``.
 
     Land takes its nearest ocean cell; a side whose outer ``halo`` cells hold
@@ -155,8 +155,16 @@ def wall_fill_index(mask, halo: int):
     Computed once on the host from the static mask; ``x[idx]`` then applies the
     fill to a (ny, nx, ...) array inside jit. ``halo=0`` gives the plain
     nearest-ocean fill.
+
+    ``pad_ns=False``: ``mask`` already carries its halo, as eophis hands it to
+    ml_models. ``pad_ns=True``: ``mask`` has none (legoESM fields), so
+    ``halo`` land rows are first added at the south and north edges, as NEMO's
+    closed-side halos; the indices then address the padded (ny + 2 halo, nx)
+    array, which :func:`predict_eke` builds and crops back.
     """
     mask = np.asarray(mask)
+    if pad_ns:
+        mask = np.pad(mask, ((halo, halo), (0, 0)))
     near = distance_transform_edt(mask == 0, return_distances=False, return_indices=True)
     ny, nx = mask.shape
     south, north = (0 if s.any() else halo for s in (mask[:halo], mask[ny - halo:]))
@@ -193,8 +201,10 @@ def predict_eke(net: EKEUNet, vor, mask, fill_index, periodic_x: bool = False):
 
     Port of ``ml_models.ml_geometric`` minus its NEMO reshaping and its
     non-finite check (which raises, so cannot run under jit): preprocess and
-    clip, wall fill (``fill_index`` from :func:`wall_fill_index`), edge-pad to
-    a multiple of ``2**depth``, network, crop, exp, zero on land.
+    clip, wall fill (``fill_index`` from :func:`wall_fill_index`; built with
+    ``pad_ns=True``, the N/S halo rows are added here first and cropped after
+    the network), edge-pad to a multiple of ``2**depth``, network, crop, exp,
+    zero on land.
 
     ``periodic_x``: the domain wraps in x (legoESM DINO's channel), so
     ``WRAP_COLUMNS`` columns from the opposite side are added on each side
@@ -202,16 +212,21 @@ def predict_eke(net: EKEUNet, vor, mask, fill_index, periodic_x: bool = False):
     in the network's dtype (float32); the result is cast back to ``vor``'s.
     """
     ny, nx = mask.shape
+    # halo rows added at each N/S edge by wall_fill_index(pad_ns=True), else 0
+    h, odd = divmod(fill_index[0].shape[0] - ny, 2)
+    if odd or h < 0 or fill_index[0].shape[1] != nx:
+        raise ValueError(f"fill_index shape {fill_index[0].shape} does not fit mask {mask.shape}")
     out_dtype = vor.dtype
     dt = net.out_kernel.dtype
-    x = preprocess(vor.astype(dt), mask.astype(dt))[fill_index]
+    x = preprocess(vor.astype(dt), mask.astype(dt))
+    x = jnp.pad(x, ((h, h), (0, 0), (0, 0)))[fill_index]
     w = WRAP_COLUMNS if periodic_x else 0
     # shortcut: the land fill's nearest ocean cell does not look across the seam;
     # revisit if coasts next to the seam matter.
     x = jnp.pad(x, ((0, 0), (w, w), (0, 0)), mode="wrap")
     m = 2 ** len(net.enc)
-    x = jnp.pad(x, ((0, -ny % m), (0, -(nx + 2 * w) % m), (0, 0)), mode="edge")
-    log_eke = net(x)[:ny, w:w + nx, 0]
+    x = jnp.pad(x, ((0, -(ny + 2 * h) % m), (0, -(nx + 2 * w) % m), (0, 0)), mode="edge")
+    log_eke = net(x)[h:h + ny, w:w + nx, 0]
     ocean = mask > 0
     # exp only of ocean values: an overflow on land would make the gradient NaN
     return jnp.where(ocean, jnp.exp(jnp.where(ocean, log_eke, 0.0)), 0.0).astype(out_dtype)

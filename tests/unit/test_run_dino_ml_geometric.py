@@ -1,7 +1,7 @@
 """ML-GEOMETRIC through the DINO driver (scripts/run/run_dino.py): the
 committed 1 degree deck, the U-Net hook, and a short forward run on CPU.
 
-Namelist values here are TEST-ONLY; the deck leaves them null.
+Namelist values in TEST_NAMELIST are TEST-ONLY (they override the deck's).
 """
 
 from __future__ import annotations
@@ -39,20 +39,23 @@ def _build(monkeypatch, argv):
         set_policy(prev)
 
 
-def test_deck_selects_ml_geometric_and_is_rejected_until_namelist_given(
-        monkeypatch):
-    with pytest.raises(ValueError) as e:
-        _build(monkeypatch, [])
-    for name in ("rn_geom", "rn_SFmin", "rn_SFmax", "rn_ross_min",
-                 "rn_aeiv_min", "rn_aeiv_max"):
-        assert name in str(e.value)
+@pytest.mark.skipif(not (_REPO / "results" / "eke_unet" / "model_20260929-121036.npz").exists(),
+                    reason="converted U-Net weights not present")
+def test_deck_builds_and_writes_unet_eke(monkeypatch):
+    """The deck as committed (namelist values, real weights, halo 22) builds and
+    the U-Net writes finite surface EKE: > 0 on ocean, 0 on land."""
+    run = _build(monkeypatch, [])
+    assert run.steps_per_day == 32
+    eke = np.asarray(run.state.eke.data)
+    wet = np.asarray(run.state.land_mask.data) > 0.5
+    assert np.all(np.isfinite(eke)) and np.all(eke[wet] > 0) and np.all(eke[~wet] == 0)
 
 
 @pytest.mark.slow
 def test_two_step_forward_run_with_ml_geometric(monkeypatch, tmp_path):
     """Two 1 degree steps on CPU: U-Net EKE written before step 1 and carried
-    through the step unchanged, state finite, 3-D kappa within its bounds
-    (0 on dry cells; <= kappa_max * max(1, sf_max) on wet ones)."""
+    through the step unchanged, state finite, face kappas within their bounds
+    (0 on closed faces; in (0, kappa_max * max(1, sf_max)] on wet ones)."""
     import jax
     import jax.numpy as jnp
     from legoesm.core.precision import PrecisionPolicy, get_policy, set_policy
@@ -60,6 +63,7 @@ def test_two_step_forward_run_with_ml_geometric(monkeypatch, tmp_path):
     from legoesm.ocean.physics.lateral_mixing.gm_redi_latlon_cgrid import (
         gm_redi_density_and_jacobian,
         native_ml_geometric_kappa_for_state,
+        nemo_iso_face_masks,
     )
 
     from tests.unit.test_eke_unet import _tiny_npz
@@ -68,8 +72,7 @@ def test_two_step_forward_run_with_ml_geometric(monkeypatch, tmp_path):
         pytest.skip("needs JAX_ENABLE_X64=1")
     run = _build(monkeypatch, [
         *TEST_NAMELIST,
-        "--ml-geometric-weights", str(_tiny_npz(tmp_path / "tiny.npz")),
-        "--ml-geometric-wall-halo", "0"])
+        "--ml-geometric-weights", str(_tiny_npz(tmp_path / "tiny.npz"))])
     assert run.steps_per_day == 32                    # 86400 / 2700
     prev = get_policy()
     set_policy(PrecisionPolicy.fp64())
@@ -91,7 +94,7 @@ def test_two_step_forward_run_with_ml_geometric(monkeypatch, tmp_path):
             run.grid, run.z, eos=c.eos, eos_linear=c.eos_linear,
             eos_nemo_seos=c.eos_nemo_seos, mask=state.land_mask.data,
             rho_0=c.constants.rho_0, g=c.constants.g, eos_depth=c.eos_depth)
-        kappa = np.asarray(native_ml_geometric_kappa_for_state(
+        aeiu, aeiv = (np.asarray(a) for a in native_ml_geometric_kappa_for_state(
             rho, state.T.data, state.S.data, state.land_mask.data,
             state.u_mask.data, state.v_mask.data, run.z, run.grid, c.gm_redi,
             make_eos_fn(c.eos, c.eos_linear, eos_nemo_seos=c.eos_nemo_seos,
@@ -102,6 +105,8 @@ def test_two_step_forward_run_with_ml_geometric(monkeypatch, tmp_path):
     finally:
         set_policy(prev)
     act = np.asarray(run.z.is_active) & wet[..., None]
-    assert np.all(np.isfinite(kappa))
-    assert np.all(kappa[~act] == 0.0)
-    assert kappa[act].min() > 0.0 and kappa[act].max() <= 3000.0
+    umask, vmask, _ = (np.asarray(m) > 0.5 for m in nemo_iso_face_masks(
+        state.u_mask.data, state.v_mask.data, jnp.asarray(act, jnp.float64)))
+    for k, face in ((aeiu, umask), (aeiv, vmask)):
+        assert np.all(np.isfinite(k)) and np.all(k[~face] == 0.0)
+        assert k[face].min() > 0.0 and k[face].max() <= 3000.0

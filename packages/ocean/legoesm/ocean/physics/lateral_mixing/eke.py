@@ -897,15 +897,27 @@ def ml_geometric_kappa_w(kappa_sfc, sf_w, wmask):
     return (kappa_sfc[..., None] * sf_w * wmask).at[..., 0].set(kappa_sfc)
 
 
-def ml_geometric_kappa_t(kappa_w, wmask, tmask):
-    """W-level coefficient averaged onto T levels: ``(k_w(jk) + k_w(jk+1)) /
-    max(wet W count, 1)·tmask`` — the vertical half of ldfeke's 4-point
-    u/v-face average (:574-583); the model's bolus takes the horizontal half
-    as a plain two-point face mean."""
+def ml_geometric_kappa_faces(kappa_w, wmask, umask, vmask):
+    """GM coefficient on u- and v-faces at T levels, ``(aeiu, aeiv)``
+    (:572-583): the sum of the 4 surrounding W values (the two columns, W
+    levels jk and jk+1) over ``max(wet W count, 1)``, times the face mask.
+
+    All (n_lat, n_lon, nlev); W index k = top of cell k; ``umask`` = east face
+    of cell i, ``vmask`` = north face of cell j (``nemo_iso_face_masks``).
+    x wraps (the lat-lon C-grid is periodic); the y wrap only reaches the
+    northern boundary faces, which ``vmask`` closes.
+    """
     zero = jnp.zeros_like(kappa_w[..., :1])
-    kb = jnp.concatenate([kappa_w[..., 1:], zero], axis=-1)
-    wb = jnp.concatenate([wmask[..., 1:], zero], axis=-1)
-    return (kappa_w * wmask + kb * wb) / jnp.maximum(wmask + wb, 1.0) * tmask
+    below = lambda a: jnp.concatenate([a[..., 1:], zero], axis=-1)  # level jk+1, 0 under the bottom
+
+    def face(ax, fmask):
+        kn, wn = jnp.roll(kappa_w, -1, ax), jnp.roll(wmask, -1, ax)
+        # Fortran summation order (its "add () for NP repro")
+        num = (kappa_w + kn) + (below(kappa_w) + below(kn))
+        cnt = wmask + wn + below(wmask) + below(wn)
+        return num / jnp.maximum(cnt, 1.0) * fmask
+
+    return face(1, umask), face(0, vmask)
 
 
 def validate_ml_geometric_config(ml: MLGeometricConfig) -> None:
@@ -1109,7 +1121,7 @@ __all__ = [
     "ml_geometric_column_integrals",
     "ml_geometric_kappa_surface",
     "ml_geometric_kappa_w",
-    "ml_geometric_kappa_t",
+    "ml_geometric_kappa_faces",
     "validate_ml_geometric_config",
     "geometric_rossby_radius",
     "geometric_kappa_gm",

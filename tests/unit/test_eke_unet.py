@@ -91,15 +91,47 @@ def test_wall_fill_reflects_about_wall_and_keeps_open_sides():
     r1 = halo + 1
     mask[:r1] = 0.0
     a = np.arange(float(mask.shape[0]))[:, None] * mask
-    f = a[wall_fill_index(mask, halo)]
+    f = a[wall_fill_index(mask, halo, pad_ns=False)]
     assert f[r1 - 3:r1 + 2, 0].tolist() == [r1 + 1, r1, r1, r1, r1 + 1]
     assert np.array_equal(f[r1:], a[r1:])
+
+
+def test_closed_ns_halo_added_and_cropped_as_nemo(tmp_path):
+    """pad_ns=True: a field with no halo gets NEMO's closed N/S halo (halo land
+    rows, nearest-ocean fill, reflect about the edge), the network runs on the
+    padded field, and the halo rows are cropped off.
+
+    5 x 4 field, halo 2: a coast cell, an island, a land north row. Cell (r, c)
+    holds 10 r + c + 1. EXPECTED is ml_models.fill_reflect_about_wall (HALO = 2)
+    on the field padded with 2 land rows at N and S (run 2026-11-11, AI4PEX
+    inference_testing/DINO/ml_models.py)."""
+    mask = np.ones((5, 4))
+    mask[0, 0] = mask[2, 2] = 0.0
+    mask[4] = 0.0
+    a = (10.0 * np.arange(5)[:, None] + np.arange(4)[None, :] + 1) * mask
+    expected = np.array([[21, 22, 22, 24], [11, 12, 13, 14],
+                         [11, 2, 3, 4], [11, 12, 13, 14], [21, 22, 22, 24],
+                         [31, 32, 33, 34], [31, 32, 33, 34],
+                         [31, 32, 33, 34], [21, 22, 22, 24]], dtype=float)
+    idx = wall_fill_index(mask, 2, pad_ns=True)
+    assert np.array_equal(np.pad(a, ((2, 2), (0, 0)))[idx], expected)
+
+    net = jax.tree.map(lambda w: w.astype(jnp.float64),
+                       load_eke_unet(_tiny_npz(tmp_path / "tiny.npz")))
+    vor = jnp.asarray(0.1 * np.random.default_rng(2).standard_normal((5, 4)))
+    x = np.asarray(preprocess(vor, jnp.asarray(mask)))
+    src = (expected - 1).astype(int)                      # source cell of each filled value
+    filled = x[src // 10, src % 10]                       # (9, 4, 1)
+    log_eke = net(jnp.pad(filled, ((0, 3), (0, 0), (0, 0)), mode="edge"))[2:7, :, 0]
+    ref = np.where(mask > 0, np.exp(np.asarray(log_eke)), 0.0)
+    got = np.asarray(predict_eke(net, vor, jnp.asarray(mask), idx))
+    np.testing.assert_allclose(got, ref, rtol=1e-12, atol=0)
 
 
 def test_tiny_network_shapes_jit_and_gradients(tmp_path):
     net = load_eke_unet(_tiny_npz(tmp_path / "tiny.npz"))
     vor, mask = (jnp.asarray(a, jnp.float32) for a in _fields(13, 10))
-    idx = wall_fill_index(np.asarray(mask), 0)
+    idx = wall_fill_index(np.asarray(mask), 0, pad_ns=False)
 
     eke = predict_eke(net, vor, mask, idx)
     assert eke.shape == (13, 10) and eke.dtype == jnp.float32
@@ -145,7 +177,7 @@ def test_periodic_x_makes_prediction_shift_equivariant(tmp_path):
     rng = np.random.default_rng(3)
     vor = jnp.asarray(0.3 * rng.standard_normal((16, 40)), jnp.float32)
     mask = jnp.ones((16, 40), jnp.float32)
-    idx = wall_fill_index(np.asarray(mask), 0)
+    idx = wall_fill_index(np.asarray(mask), 0, pad_ns=False)
     for periodic, close in ((True, True), (False, False)):
         a = predict_eke(net, vor, mask, idx, periodic_x=periodic)
         b = predict_eke(net, jnp.roll(vor, 8, axis=1), mask, idx, periodic_x=periodic)
@@ -163,7 +195,7 @@ def test_parity_with_committed_tiny_tensorflow_reference():
     # TF side ran ml_models' own fill_reflect_about_wall and pad_to_multiple
     mask = w["online_mask"]
     eke = np.asarray(predict_eke(net, jnp.asarray(w["online_vor"], jnp.float32), jnp.asarray(mask, jnp.float32),
-                                 wall_fill_index(mask, int(w["online_halo"]))))
+                                 wall_fill_index(mask, int(w["online_halo"]), pad_ns=False)))
     ref = w["online_eke"]
     assert np.all(eke[mask == 0] == 0.0)
     # compared in log EKE: the random tiny net reaches log EKE ~19, where float32

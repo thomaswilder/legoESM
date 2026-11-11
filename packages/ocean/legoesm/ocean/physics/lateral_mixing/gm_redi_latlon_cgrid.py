@@ -2130,12 +2130,6 @@ def nemo_eiv_bolus_transport(
     BEFORE the tracer scheme).  Axes: ``(lat=jj, lon=ji, lev=jk)``.
     """
     ax_y, ax_x, ax_z = 0, 1, 2
-    if isinstance(kappa_GM, jnp.ndarray) and kappa_GM.ndim == 3:
-        aeiu = jnp.broadcast_to(kappa_GM, out_shape)
-    elif isinstance(kappa_GM, jnp.ndarray) and kappa_GM.ndim == 2:
-        aeiu = jnp.broadcast_to(kappa_GM[:, :, jnp.newaxis], out_shape)
-    else:
-        aeiu = jnp.broadcast_to(jnp.asarray(kappa_GM, dtype=dtype), out_shape)
     # NEMO averages kappa onto EACH FACE separately before building psi
     # (ldftra.F90:715-718):
     #     zaeiu(ji,jj) = 0.5*( zaeiw(ji,jj) + zaeiw(ji+1,jj) ) * ssumask
@@ -2144,11 +2138,22 @@ def nemo_eiv_bolus_transport(
     # EXACT only for a constant kappa; the Treguier kappa is spatially 2-D, so
     # it leaves a half-cell offset in the bolus transport.  Opt-in so the
     # legacy path stays bit-identical.
-    if kappa_face_average:
-        aeiu_u = 0.5 * (aeiu + jnp.roll(aeiu, -1, ax_x))       # -> u-face
-        aeiu_v = 0.5 * (aeiu + jnp.roll(aeiu, -1, ax_y))       # -> v-face
+    if isinstance(kappa_GM, tuple):
+        # already on the faces, (aeiu, aeiv) at T levels (ML-GEOMETRIC:
+        # ldfeke.F90's 4-point wet-count average); no further averaging.
+        aeiu_u, aeiu_v = kappa_GM
     else:
-        aeiu_u = aeiu_v = aeiu
+        if isinstance(kappa_GM, jnp.ndarray) and kappa_GM.ndim == 3:
+            aeiu = jnp.broadcast_to(kappa_GM, out_shape)
+        elif isinstance(kappa_GM, jnp.ndarray) and kappa_GM.ndim == 2:
+            aeiu = jnp.broadcast_to(kappa_GM[:, :, jnp.newaxis], out_shape)
+        else:
+            aeiu = jnp.broadcast_to(jnp.asarray(kappa_GM, dtype=dtype), out_shape)
+        if kappa_face_average:
+            aeiu_u = 0.5 * (aeiu + jnp.roll(aeiu, -1, ax_x))       # -> u-face
+            aeiu_v = 0.5 * (aeiu + jnp.roll(aeiu, -1, ax_y))       # -> v-face
+        else:
+            aeiu_u = aeiu_v = aeiu
     aeiu_if_u = 0.5 * (aeiu_u + jnp.roll(aeiu_u, -1, ax_z))   # mk() at iface below k
     aeiu_if_v = 0.5 * (aeiu_v + jnp.roll(aeiu_v, -1, ax_z))
     wslpi_u = 0.5 * (wslpi_kp1 + jnp.roll(wslpi_kp1, -1, ax_x))  # mi(wslpi) -> u-face
@@ -4060,9 +4065,10 @@ def native_ml_geometric_kappa_for_state(
     jacobian, eta, H_bathy, prd_jacobian, prd_TS, pn2, e3w,
     f_coriolis, rho_0, g, omega, eke_sfc,
 ):
-    """ML-GEOMETRIC 3-D GM coefficient (n_lat, n_lon, nlev) on T levels from
-    the SURFACE EKE ``eke_sfc`` [m²/s²] (port of the user's NEMO
-    ``ldfeke.F90`` ML branch; formulas in ``eke.ml_geometric_*``).
+    """ML-GEOMETRIC 3-D GM coefficient on u- and v-faces at T levels,
+    ``(aeiu, aeiv)`` each (n_lat, n_lon, nlev), from the SURFACE EKE
+    ``eke_sfc`` [m²/s²] (port of the user's NEMO ``ldfeke.F90`` ML branch;
+    formulas in ``eke.ml_geometric_*``). The bolus takes the pair as is.
 
     Built from the SAME native operands as the NEMO-native Treguier kappa
     (:func:`native_treguier_kappa_for_state`): ldfslp's w-slopes with the
@@ -4071,8 +4077,8 @@ def native_ml_geometric_kappa_for_state(
     from legoesm.ocean.physics.lateral_mixing.eke import (
         ml_geometric_column_integrals,
         ml_geometric_depth_integrated_eke,
+        ml_geometric_kappa_faces,
         ml_geometric_kappa_surface,
-        ml_geometric_kappa_t,
         ml_geometric_kappa_w,
         ml_geometric_structure_function_t,
         ml_geometric_structure_function_w,
@@ -4111,8 +4117,8 @@ def native_ml_geometric_kappa_for_state(
         eke_sfc, ml_geometric_structure_function_t(sf_w, mbkt), e3t, act)
     kappa_sfc = ml_geometric_kappa_surface(
         eke_int, zn_slp, zn, H_bathy, f_coriolis, omega, act[..., 0], ml)
-    return ml_geometric_kappa_t(
-        ml_geometric_kappa_w(kappa_sfc, sf_w, wmask3), wmask3, act)
+    return ml_geometric_kappa_faces(
+        ml_geometric_kappa_w(kappa_sfc, sf_w, wmask3), wmask3, umask3, vmask3)
 
 
 def gm_redi_tracer_tendency_latlon(

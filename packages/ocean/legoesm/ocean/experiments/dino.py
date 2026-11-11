@@ -696,8 +696,9 @@ class DINOConfig:
     ml_geometric_kappa_min: float | None = None  # rn_aeiv_min [m²/s]
     ml_geometric_kappa_max: float | None = None  # rn_aeiv_max [m²/s]
     # U-Net weights (.npz from scripts/data/convert_eke_unet_keras_to_npz.py)
-    # and the wall-fill halo width of its land fill (ml_models HALO). Read by
-    # the run driver only (the network runs outside the model step).
+    # and the halo width of its land fill (ml_models HALO): that many land
+    # rows are added at the N/S edges, as NEMO's closed-side halos, then cropped.
+    # Read by the run driver only (the network runs outside the model step).
     ml_geometric_weights: str | None = None
     ml_geometric_wall_halo: int | None = None
     visbeck_alpha: float = 0.015   # Visbeck dimensionless prefactor
@@ -3422,8 +3423,8 @@ def ml_geometric_refresh_eke(state, net, grid, fill_index):
     differentiable w.r.t. ``net``. Input: surface relative vorticity / f from
     ``state``'s velocities. ``fill_index`` from
     :func:`legoesm.ml.eke_unet.wall_fill_index` on the surface land mask
-    (host-side, built once). The lat-lon C-grid is zonally periodic (every
-    x stencil rolls), so the network wraps in x.
+    with ``pad_ns=True`` (host-side, built once). The lat-lon C-grid is
+    zonally periodic (every x stencil rolls), so the network wraps in x.
     """
     from legoesm.ml.eke_unet import predict_eke, surface_vorticity_over_f
     mask = state.land_mask.data

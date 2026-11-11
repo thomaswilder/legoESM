@@ -102,11 +102,10 @@ def test_unet_weight_gradient_matches_finite_difference_on_ml_geometric_card(
          "--ml-geometric-alpha", "0.04", "--ml-geometric-sf-min", "0.1",
          "--ml-geometric-sf-max", "1.0", "--ml-geometric-ross-min-m", "2000",
          "--ml-geometric-kappa-min", "10", "--ml-geometric-kappa-max", "1e5",
-         "--ml-geometric-weights", str(_tiny_npz(tmp_path / "tiny.npz")),
-         "--ml-geometric-wall-halo", "0"],
+         "--ml-geometric-weights", str(_tiny_npz(tmp_path / "tiny.npz"))],
         n_steps=2, eps_rel=1.0e-3, unet_index=(0, 0, 1, 0))
     # The smaller FD step: at eps_rel 1e-3 a cap/switch kink sits inside the
-    # stencil (FD off by 1.8%); at 1e-4 AD and FD agree to 4.4e-6.
+    # stencil (FD off by 1.8%); at 1e-4 AD and FD agree to 1.3e-5 (halo 22).
     fd = r["fd"][min(r["fd"])]
     assert math.isfinite(r["ad"]) and r["ad"] != 0.0
     assert abs(r["ad"] - fd) / abs(fd) < 1.0e-3

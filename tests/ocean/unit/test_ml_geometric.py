@@ -22,14 +22,16 @@ from legoesm.ocean.physics.lateral_mixing.eke import (
     MLGeometricConfig,
     ml_geometric_column_integrals,
     ml_geometric_depth_integrated_eke,
+    ml_geometric_kappa_faces,
     ml_geometric_kappa_surface,
-    ml_geometric_kappa_t,
     ml_geometric_kappa_w,
     ml_geometric_structure_function_t,
     ml_geometric_structure_function_w,
     validate_eke_config,
 )
 from legoesm.ocean.physics.lateral_mixing.gm_redi_latlon_cgrid import (
+    nemo_eiv_bolus_transport,
+    nemo_iso_face_masks,
     validate_ml_geometric_gm_config,
 )
 
@@ -133,14 +135,58 @@ def test_kappa_surface_cap_tapers_floor_in_fortran_order():
     assert k[3] == pytest.approx(0.05 * 2.0 / 1e-3 * 0.5, rel=1e-12)
 
 
-def test_kappa_w_surface_weight_one_and_t_wet_count_average():
+def test_kappa_w_surface_weight_one():
     kw = np.asarray(ml_geometric_kappa_w(jnp.asarray([100.0]), _col(SF_W),
                                          _col(WMASK)))[0]
     # surface weight 1 although SF_w(surface) = 0; below: SF_w * wmask
     np.testing.assert_allclose(kw, [100.0, 150.0, 100.0, 150.0, 0.0, 0.0])
-    kt = np.asarray(ml_geometric_kappa_t(_col(kw), _col(WMASK), _col(TMASK)))[0]
-    # (k_w(k) + k_w(k+1)) / wet W count; bottom wet cell has one wet W level.
-    np.testing.assert_allclose(kt, [125.0, 125.0, 125.0, 150.0, 0.0, 0.0])
+
+
+def test_kappa_faces_four_point_wet_count_beside_a_depth_step():
+    """ldfeke.F90:572-583 on a 2x2 grid of two columns: A (4 wet cells,
+    kappa_sfc 100) and B (3 wet cells, kappa_sfc 200), rows [A, B] and [B, A],
+    so every wet u- and v-face joins A and B; the north edge is closed."""
+    tmask_a = TMASK
+    tmask_b = np.array([1.0, 1.0, 1.0, 0.0, 0.0, 0.0])
+    act = jnp.asarray(np.array([[tmask_a, tmask_b], [tmask_b, tmask_a]]))
+    v_mask = jnp.ones((3, 2)).at[2].set(0.0)               # closed north edge
+    umask, vmask, wmask = nemo_iso_face_masks(jnp.ones((2, 3)), v_mask, act)
+    k_sfc = jnp.asarray([[100.0, 200.0], [200.0, 100.0]])
+    sf_w = jnp.broadcast_to(jnp.asarray(SF_W), act.shape)
+    aeiu, aeiv = (np.asarray(a) for a in ml_geometric_kappa_faces(
+        ml_geometric_kappa_w(k_sfc, sf_w, wmask), wmask, umask, vmask))
+    # W values: A = [100, 150, 100, 150, 0, 0], B = [200, 300, 200, 0, 0, 0].
+    # k = 0, 1: (A_k + B_k + A_k+1 + B_k+1) / 4 = 187.5. k = 2, beside B's
+    # bottom: (100 + 200 + 150 + 0) / 3 wet W points = 150 (the per-column
+    # average then a two-point mean gave 0.5 * (125 + 200) = 162.5).
+    # k >= 3: B dry, face closed.
+    face = np.array([187.5, 187.5, 150.0, 0.0, 0.0, 0.0])
+    np.testing.assert_allclose(aeiu, np.broadcast_to(face, aeiu.shape), rtol=1e-14)
+    np.testing.assert_allclose(aeiv[0], np.broadcast_to(face, aeiv[0].shape), rtol=1e-14)
+    assert np.all(aeiv[1] == 0.0)                          # north edge
+
+
+def test_bolus_takes_face_pair_as_is():
+    """A (aeiu, aeiv) pair reaches psi without another face average: the pair
+    (K, K) gives exactly the transport of the cell field K with averaging
+    off, and swapping in a different aeiv changes only the v-side psi."""
+    shape = (4, 5, 3)
+    rng = np.random.default_rng(0)
+    k3 = jnp.asarray(rng.uniform(100.0, 1000.0, shape))
+    wslp = [jnp.asarray(rng.normal(0, 1e-3, shape)) for _ in range(2)]
+    ones = jnp.ones(shape)
+
+    def run(kappa, face_avg):
+        return nemo_eiv_bolus_transport(
+            kappa, *wslp, jnp.full((4, 5), 1e4), jnp.full((4, 5), 1e4),
+            jnp.ones((4, 6)), jnp.ones((5, 5)), ones, ones, shape,
+            jnp.float64, kappa_face_average=face_avg)
+
+    for a, b in zip(run((k3, k3), True), run(k3, False)):
+        assert jnp.array_equal(a, b)
+    u0, v0, _ = run((k3, k3), True)
+    u1, v1, _ = run((k3, 2.0 * k3), True)
+    assert jnp.array_equal(u0, u1) and jnp.allclose(v1, 2.0 * v0, rtol=1e-14)
 
 
 def test_gradients_finite_at_zero_stratification():

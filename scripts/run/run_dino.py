@@ -860,8 +860,9 @@ def build_run(args):
                 "must divide 86400 s.")
         steps_per_day = int(round(86400.0 / dt))
         net = load_eke_unet(cfg.ml_geometric_weights)
+        # legoESM fields carry no halo: add NEMO's closed N/S halo rows
         _fill = wall_fill_index(np.asarray(state.land_mask.data),
-                                cfg.ml_geometric_wall_halo)
+                                cfg.ml_geometric_wall_halo, pad_ns=True)
 
         def refresh_eke(s, net=net):
             return ml_geometric_refresh_eke(s, net, grid, _fill)

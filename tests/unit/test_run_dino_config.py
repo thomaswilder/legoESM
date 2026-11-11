@@ -716,5 +716,5 @@ def test_ml_geometric_deck_carries_namelist_values(monkeypatch):
             args.ml_geometric_kappa_min, args.ml_geometric_kappa_max) == (
         0.06, 1.0, 1.0, 7.0e3, 10.0, 3.0e4)
     assert args.nemo_channel_rows == "ai4pex" and args.nemo_resolution == "R1"
-    assert args.ml_geometric_wall_halo is None
+    assert args.ml_geometric_wall_halo == 22   # AI4PEX ml_models.HALO
     assert args.dt == 2700.0 and args.recipe == "nemo_dino_kamm_mlf"

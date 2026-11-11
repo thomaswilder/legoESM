@@ -12,10 +12,12 @@
 # (nemo-fortran-heritage/namelist_cfg, a 1/4 deg config; user: same values at
 # 1 deg). rn_SFmin = rn_SFmax = 1, so the structure function is 1 below the
 # surface. Channel rows follow the AI4PEX NEMO build (the training data's mesh).
-# NOT RUNNABLE YET: the U-Net land-fill halo width (ml_models HALO) is unset
-# pending how the halo is reproduced; the loader rejects the card.
+# U-Net halo as in the user's NEMO inference (AI4PEX inference_testing/DINO):
+# 22 land rows added at the N and S edges, land filled from the nearest ocean,
+# the halo reflected about the edge, cropped after the network. x wraps
+# (periodic channel), unlike NEMO's closed x.
 #
-# Reproduce once filled in:
+# Reproduce:
 #   JAX_PLATFORMS=cuda JAX_ENABLE_X64=1 python scripts/run/run_dino.py \
 #       --config scripts/experiment/dino/nemo_faithful_kamm_mlf_ml_geometric.yaml
 recipe: nemo_dino_kamm_mlf
@@ -36,4 +38,4 @@ ml_geometric_ross_min_m: 7.0e3   # rn_ross_min [m]
 ml_geometric_kappa_min: 10.0    # rn_aeiv_min [m2/s]
 ml_geometric_kappa_max: 3.0e4    # rn_aeiv_max [m2/s]
 ml_geometric_weights: results/eke_unet/model_20260929-121036.npz
-ml_geometric_wall_halo: null    # ml_models HALO (land-fill halo width)
+ml_geometric_wall_halo: 22      # ml_models.HALO = 22; eophis 'halos': 22, 'bnd': ('close','close') in main.py
