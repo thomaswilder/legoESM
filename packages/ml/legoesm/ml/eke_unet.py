@@ -1,0 +1,217 @@
+"""EKE U-Net: JAX port of the Keras U-Net that predicts surface EKE for GEOMETRIC.
+
+The network was trained in TensorFlow/Keras (``unet.UNet`` in the AI4PEX
+``machine_learning`` repo) and runs online in NEMO DINO at 1/4 deg through
+eophis, where ``ml_models.ml_geometric`` turns surface fields into the
+eddy kinetic energy the GEOMETRIC GM closure needs. This module reproduces
+that inference path so the network can be differentiated w.r.t. its weights
+inside legoESM.
+
+The ported model is the vorticity-only one, ``model_20260929-121036``
+(feature-ablation sweep, trained on SO_JET/EAST/GYRE/TROP; its provenance
+lists ``features: ['vor']``). Its single input is surface relative vorticity
+divided by f, as in training (``preprocess_data.normalize_data``).
+
+Architecture (depth 2, base 64 filters):
+each conv block is two of [1-cell edge-replicating pad -> 3x3 conv, no bias
+-> BatchNorm (moving statistics) -> ReLU]. Encoder blocks of 64 and 128
+filters each followed by a 2x2 max pool, a 256-filter bottleneck, decoder
+blocks of 128 and 64 filters each preceded by 2x nearest upsampling and a
+concatenation [upsampled, skip], then a 1x1 conv without bias to one channel
+(log EKE). Keras' ``ReplicationPadding2D`` uses ``tf.pad(..., 'SYMMETRIC')``;
+for a 1-cell pad that equals edge replication, and ``jnp.pad`` mode
+``"symmetric"`` reproduces it for any width.
+
+Only inference is ported: BatchNorm uses its moving statistics and the
+spatial dropout of the encoder is off (Keras ``training=False``). The moving
+statistics are frozen (no gradient reaches them), so fine-tuning trains the
+convolutions and BatchNorm's scale and shift only. They are still pytree
+leaves: an optimizer with weight decay must mask them out.
+
+Online, :func:`surface_vorticity_over_f` builds the input from the model's
+velocities, and :func:`predict_eke` runs the network on it.
+
+Weights come from a plain ``.npz`` written by
+``scripts/data/convert_eke_unet_keras_to_npz.py`` (TensorFlow is not needed
+to load it).
+"""
+
+from __future__ import annotations
+
+import equinox as eqx
+import jax
+import jax.numpy as jnp
+import numpy as np
+from scipy.ndimage import distance_transform_edt
+
+# vorticity/f normalisation (mean, std): the norm_stats in the model's provenance
+VOR_MEAN, VOR_STD = -0.0025, 0.1423
+# normalised inputs are clipped to +/- this many standard deviations (ml_models.CLIP_SIGMA)
+CLIP_SIGMA = 5.0
+# floor on |f| [1/s] in vorticity/f (user's choice, 2026-11-11)
+F_MIN = 1e-7
+# columns wrapped onto each side of a zonally periodic domain; >= the network's
+# receptive half-width (23 cells, measured 2026-11-11)
+WRAP_COLUMNS = 24
+
+
+class ConvBN(eqx.Module):
+    """Edge-replicating pad, 3x3 conv (no bias), BatchNorm (inference), ReLU on (H, W, C)."""
+    kernel: jax.Array  # (3, 3, C_in, C_out), Keras HWIO layout
+    gamma: jax.Array
+    beta: jax.Array
+    mean: jax.Array
+    var: jax.Array
+    eps: float = eqx.field(static=True)
+
+    def __call__(self, x):
+        x = jnp.pad(x, ((1, 1), (1, 1), (0, 0)), mode="symmetric")
+        x = jax.lax.conv_general_dilated(
+            x[None], self.kernel, window_strides=(1, 1), padding="VALID",
+            dimension_numbers=("NHWC", "HWIO", "NHWC"),
+        )[0]
+        # moving statistics frozen: training them by gradient breaks BatchNorm
+        # (a variance of 0.0049 vs eps 1e-3 goes NaN within a few Adam steps)
+        mean, var = jax.lax.stop_gradient((self.mean, self.var))
+        # same operation order as tf.nn.batch_normalization
+        inv = jax.lax.rsqrt(var + self.eps) * self.gamma
+        return jax.nn.relu(x * inv + (self.beta - mean * inv))
+
+
+class EKEUNet(eqx.Module):
+    """The EKE U-Net on one sample: (H, W, 1) normalised vorticity/f -> (H, W, 1) log EKE.
+
+    H and W must be multiples of ``2**len(enc)``; :func:`predict_eke` pads to that.
+    """
+    enc: list   # per level, (ConvBN, ConvBN)
+    bottleneck: tuple
+    dec: list   # coarse to fine, (ConvBN, ConvBN)
+    out_kernel: jax.Array  # (1, 1, C, 1)
+
+    def __call__(self, x):
+        skips = []
+        for c0, c1 in self.enc:
+            x = c1(c0(x))
+            skips.append(x)
+            h, w, c = x.shape
+            x = x.reshape(h // 2, 2, w // 2, 2, c).max(axis=(1, 3))
+        c0, c1 = self.bottleneck
+        x = c1(c0(x))
+        for (c0, c1), skip in zip(self.dec, reversed(skips)):
+            x = jnp.repeat(jnp.repeat(x, 2, axis=0), 2, axis=1)
+            x = c1(c0(jnp.concatenate([x, skip], axis=-1)))
+        return x @ self.out_kernel[0, 0]
+
+
+def load_eke_unet(path) -> EKEUNet:
+    """Build an :class:`EKEUNet` from the ``.npz`` written by the conversion script.
+
+    Refuses a file whose model is not the one this module describes (inputs,
+    target or vorticity normalisation differ, or the file predates those records).
+    """
+    w = np.load(path)
+    for key in ("features", "target", "vor_norm"):
+        if key not in w.files:
+            raise ValueError(f"{path}: no '{key}' record; reconvert with "
+                             "scripts/data/convert_eke_unet_keras_to_npz.py")
+    got = (list(w["features"]), list(w["target"]), tuple(float(a) for a in w["vor_norm"]))
+    if got != (["vor"], ["fine_ke"], (VOR_MEAN, VOR_STD)):
+        raise ValueError(f"{path}: model has (features, target, vor mean/std) {got}; "
+                         f"this port takes (['vor'], ['fine_ke'], {(VOR_MEAN, VOR_STD)})")
+    eps = float(w["bn_epsilon"])
+
+    def block(prefix):
+        return tuple(
+            ConvBN(*(jnp.asarray(w[f"{prefix}_{j}_{k}"])
+                     for k in ("kernel", "gamma", "beta", "mean", "var")), eps=eps)
+            for j in range(2)
+        )
+
+    depth = sum(1 for k in w.files if k.startswith("enc") and k.endswith("_0_kernel"))
+    return EKEUNet(
+        enc=[block(f"enc{i}") for i in range(depth)],
+        bottleneck=block("bottleneck"),
+        dec=[block(f"dec{i}") for i in range(depth)],
+        out_kernel=jnp.asarray(w["out_kernel"]),
+    )
+
+
+def preprocess(vor, mask):
+    """Normalised, clipped vorticity/f as (ny, nx, 1), zero on land.
+
+    Port of ``ml_models.preprocess_inputs`` followed by the clip in
+    ``ml_geometric``, on 2D (y, x) fields already in the network's
+    orientation (NEMO's (i, j, 1) squeeze and transpose are left to the caller).
+    """
+    a = jnp.clip((vor - VOR_MEAN) / VOR_STD * mask, -CLIP_SIGMA, CLIP_SIGMA)
+    return a[..., None]
+
+
+def wall_fill_index(mask, halo: int):
+    """Gather indices that reproduce ``ml_models.fill_reflect_about_wall``.
+
+    Land takes its nearest ocean cell; a side whose outer ``halo`` cells hold
+    no ocean is a closed wall, and its halo reflects about the grid edge.
+    Computed once on the host from the static mask; ``x[idx]`` then applies the
+    fill to a (ny, nx, ...) array inside jit. ``halo=0`` gives the plain
+    nearest-ocean fill.
+    """
+    mask = np.asarray(mask)
+    near = distance_transform_edt(mask == 0, return_distances=False, return_indices=True)
+    ny, nx = mask.shape
+    south, north = (0 if s.any() else halo for s in (mask[:halo], mask[ny - halo:]))
+    west, east = (0 if s.any() else halo for s in (mask[:, :halo], mask[:, nx - halo:]))
+    return tuple(np.pad(n[south:ny - north, west:nx - east],
+                        ((south, north), (west, east)), mode="reflect") for n in near)
+
+
+def surface_vorticity_over_f(u, v, grid):
+    """The network's input from model velocities: surface relative vorticity / f
+    at cell centres, (n_lat, n_lon).
+
+    The quantity the model was trained on: the C-grid curl at cell corners,
+    averaged to cell centres (``07_vorticity.py``; here legoESM's
+    ``relative_vorticity_cell_centre``), divided by f at cell centres
+    (``preprocess_data.normalize_data``). ``u`` (n_lat, n_lon+1[, nz]) and
+    ``v`` (n_lat+1, n_lon[, nz]) are face velocities with the surface at level
+    0. |f| is floored at ``F_MIN`` (sign kept, + at f == 0): the training data
+    never reached the equator, and near it the input clip saturates |zeta/f|.
+    The two curls agree in the interior but differ O(1) at coasts (Track A
+    check V4, 2026-11-10).
+    """
+    from legoesm.ocean.diagnostics import relative_vorticity_cell_centre
+
+    if u.ndim == 3:
+        u, v = u[..., 0], v[..., 0]
+    zeta = relative_vorticity_cell_centre(u, v, grid)
+    f = jnp.asarray(grid.grid_coriolis, zeta.dtype)  # f at cell centres (grids.protocol)
+    return zeta / jnp.where(f < 0, jnp.minimum(f, -F_MIN), jnp.maximum(f, F_MIN))
+
+
+def predict_eke(net: EKEUNet, vor, mask, fill_index, periodic_x: bool = False):
+    """Surface EKE on (ny, nx) from surface relative vorticity / f.
+
+    Port of ``ml_models.ml_geometric`` minus its NEMO reshaping and its
+    non-finite check (which raises, so cannot run under jit): preprocess and
+    clip, wall fill (``fill_index`` from :func:`wall_fill_index`), edge-pad to
+    a multiple of ``2**depth``, network, crop, exp, zero on land.
+
+    ``periodic_x``: the domain wraps in x (legoESM DINO's channel), so
+    ``WRAP_COLUMNS`` columns from the opposite side are added on each side
+    before the network instead of treating the x edges as closed. Inputs run
+    in the network's dtype (float32); the result is cast back to ``vor``'s.
+    """
+    ny, nx = mask.shape
+    out_dtype = vor.dtype
+    dt = net.out_kernel.dtype
+    x = preprocess(vor.astype(dt), mask.astype(dt))[fill_index]
+    w = WRAP_COLUMNS if periodic_x else 0
+    # shortcut: the land fill's nearest ocean cell does not look across the seam;
+    # revisit if coasts next to the seam matter.
+    x = jnp.pad(x, ((0, 0), (w, w), (0, 0)), mode="wrap")
+    m = 2 ** len(net.enc)
+    x = jnp.pad(x, ((0, -ny % m), (0, -(nx + 2 * w) % m), (0, 0)), mode="edge")
+    log_eke = net(x)[:ny, w:w + nx, 0]
+    ocean = mask > 0
+    # exp only of ocean values: an overflow on land would make the gradient NaN
+    return jnp.where(ocean, jnp.exp(jnp.where(ocean, log_eke, 0.0)), 0.0).astype(out_dtype)
