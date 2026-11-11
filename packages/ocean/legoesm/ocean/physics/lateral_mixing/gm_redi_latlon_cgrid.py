@@ -1555,6 +1555,39 @@ def _nemo_sqrt_nonnegative_forward_exact_jvp(primals, tangents):
     return result, result_dot
 
 
+def _nemo_native_w_operands(rho, T, S, z_coord, eos_fn, rho_0, g, act,
+                            slope_n2, jacobian, pn2_override, e3w_override):
+    """``(e3w, wmask3, pn2)`` of :func:`_nemo_wpoint_e3w_wmask_n2` with the
+    carried step-entry ``pn2``/``e3w`` operands substituted when given (they
+    hold the nlev-1 interior W levels; the surface slot is restored) — the
+    W operands NEMO's ``ldf_eiv`` and ``ldf_eke`` sum over."""
+    dtype = rho.dtype
+    e3w, wmask3, pn2 = _nemo_wpoint_e3w_wmask_n2(
+        rho, T, S, z_coord, eos_fn, rho_0, g, act,
+        slope_n2=slope_n2, jacobian=jacobian)
+    _e3w_surface = e3w[..., :1]
+    nlev = rho.shape[-1]
+    if pn2_override is not None:
+        pn2 = jnp.asarray(pn2_override, dtype=dtype)
+        if pn2.shape[-1] == nlev - 1:
+            pn2 = jnp.concatenate([jnp.zeros_like(pn2[..., :1]), pn2], axis=-1)
+        elif pn2.shape[-1] != nlev:
+            raise ValueError(
+                "pn2_override must contain nlev or nlev-1 W levels, got "
+                f"{pn2.shape[-1]} for nlev={nlev}")
+    if e3w_override is not None:
+        e3w = jnp.asarray(e3w_override, dtype=dtype)
+        if e3w.shape[-1] == nlev - 1:
+            surface_shape = e3w.shape[:-1] + (1,)
+            surface_e3w = jnp.broadcast_to(_e3w_surface, surface_shape)
+            e3w = jnp.concatenate([surface_e3w, e3w], axis=-1)
+        elif e3w.shape[-1] != nlev:
+            raise ValueError(
+                "e3w_override must contain nlev or nlev-1 W levels, got "
+                f"{e3w.shape[-1]} for nlev={nlev}")
+    return e3w, wmask3, pn2
+
+
 def compute_treguier_kappa_gm_nemo_native(
     rho: jnp.ndarray,
     T: jnp.ndarray,
@@ -1649,29 +1682,9 @@ def compute_treguier_kappa_gm_nemo_native(
     ones_z = jnp.ones((1, 1, rho.shape[-1]), dtype=dtype)
     act = (mask[:, :, None] * ones_z if active_3d is None
            else active_3d.astype(dtype))
-    e3w, wmask3, pn2 = _nemo_wpoint_e3w_wmask_n2(
-        rho, T, S, z_coord, eos_fn, rho_0, g, act,
-        slope_n2=slope_n2, jacobian=jacobian)
-    _e3w_surface = e3w[..., :1]
-    nlev = rho.shape[-1]
-    if pn2_override is not None:
-        pn2 = jnp.asarray(pn2_override, dtype=dtype)
-        if pn2.shape[-1] == nlev - 1:
-            pn2 = jnp.concatenate([jnp.zeros_like(pn2[..., :1]), pn2], axis=-1)
-        elif pn2.shape[-1] != nlev:
-            raise ValueError(
-                "pn2_override must contain nlev or nlev-1 W levels, got "
-                f"{pn2.shape[-1]} for nlev={nlev}")
-    if e3w_override is not None:
-        e3w = jnp.asarray(e3w_override, dtype=dtype)
-        if e3w.shape[-1] == nlev - 1:
-            surface_shape = e3w.shape[:-1] + (1,)
-            surface_e3w = jnp.broadcast_to(_e3w_surface, surface_shape)
-            e3w = jnp.concatenate([surface_e3w, e3w], axis=-1)
-        elif e3w.shape[-1] != nlev:
-            raise ValueError(
-                "e3w_override must contain nlev or nlev-1 W levels, got "
-                f"{e3w.shape[-1]} for nlev={nlev}")
+    e3w, wmask3, pn2 = _nemo_native_w_operands(
+        rho, T, S, z_coord, eos_fn, rho_0, g, act, slope_n2, jacobian,
+        pn2_override, e3w_override)
     e3w_3d = jnp.broadcast_to(e3w, rho.shape)
 
     # Floor at 1e-30 (not a hard 0) before sqrt: sqrt(0) has an infinite
@@ -4017,6 +4030,91 @@ def native_treguier_kappa_for_state(
     return kappa_GM
 
 
+def validate_ml_geometric_gm_config(cfg):
+    """ML-GEOMETRIC (``cfg.eke.closure == "ml_geometric"``) needs NEMO's native
+    w-slopes and NEMO's face averaging of kappa; reject every GM/Redi setting
+    under which its 3-D coefficient would be built or applied differently."""
+    _treg = getattr(cfg, "treguier", None)
+    problems = []
+    if getattr(cfg, "slope_scheme", "triads") != "nemo_iso_lap":
+        problems.append(f"slope_scheme={cfg.slope_scheme!r} (needs 'nemo_iso_lap')")
+    if getattr(cfg, "slope_positions", "mode_b") != "nemo_native":
+        problems.append(
+            f"slope_positions={cfg.slope_positions!r} (needs 'nemo_native')")
+    if not cfg.gm_bolus_kappa_face_average:
+        problems.append("gm_bolus_kappa_face_average=False (needs True)")
+    if cfg.visbeck.enabled or (_treg is not None and _treg.enabled):
+        problems.append("visbeck/treguier enabled (exactly one GM coefficient)")
+    if cfg.redi_coefficient == "nemo21":
+        problems.append("redi_coefficient='nemo21' (expects a 2-D kappa_GM)")
+    if getattr(cfg, "resolution_function", False):
+        problems.append("resolution_function=True (expects a 2-D kappa_GM)")
+    if problems:
+        raise ValueError(
+            "GMRediConfig with EKEConfig.closure='ml_geometric' is "
+            "unsupported: " + "; ".join(problems))
+
+
+def native_ml_geometric_kappa_for_state(
+    rho, T, S, mask, u_mask, v_mask, z_coord, grid, cfg, eos_fn,
+    jacobian, eta, H_bathy, prd_jacobian, prd_TS, pn2, e3w,
+    f_coriolis, rho_0, g, omega, eke_sfc,
+):
+    """ML-GEOMETRIC 3-D GM coefficient (n_lat, n_lon, nlev) on T levels from
+    the SURFACE EKE ``eke_sfc`` [m²/s²] (port of the user's NEMO
+    ``ldfeke.F90`` ML branch; formulas in ``eke.ml_geometric_*``).
+
+    Built from the SAME native operands as the NEMO-native Treguier kappa
+    (:func:`native_treguier_kappa_for_state`): ldfslp's w-slopes with the
+    mixed-layer ramp, rn2b, e3w and the zdfmxl level ``nmln`` the slopes use.
+    """
+    from legoesm.ocean.physics.lateral_mixing.eke import (
+        ml_geometric_column_integrals,
+        ml_geometric_depth_integrated_eke,
+        ml_geometric_kappa_surface,
+        ml_geometric_kappa_t,
+        ml_geometric_kappa_w,
+        ml_geometric_structure_function_t,
+        ml_geometric_structure_function_w,
+    )
+    ml = cfg.eke.ml_geometric
+    dtype = T.dtype
+    nlev = T.shape[-1]
+    act = _nemo_native_active_3d(mask, z_coord, H_bathy, dtype)
+    _, _, wslpi, wslpj = compute_nemo_native_slopes(
+        rho, T, S, mask, u_mask, v_mask, z_coord, grid, cfg, eos_fn,
+        jacobian=jacobian, eta=eta, H_bathy=H_bathy,
+        prd_jacobian=prd_jacobian, prd_TS_override=prd_TS,
+        pn2_override=pn2, e3w_override=e3w,
+        rho_0=rho_0, g=g, active_3d=act,
+    )
+    e3w_k, wmask3, pn2_k = _nemo_native_w_operands(
+        rho, T, S, z_coord, eos_fn, rho_0, g, act,
+        getattr(cfg, "slope_n2", "adiabatic"), jacobian, pn2, e3w)
+    # nmln exactly as compute_nemo_native_slopes resolves it (its ``first``
+    # is the 0-based nmln); NEMO 1-based here.
+    _, m_base = _nemo_mld(
+        cfg.mld_criterion, T, S, mask, z_coord, eos_fn, cfg.mld_rho_c,
+        g=g, rho_0=rho_0, active_3d=act, jacobian=jacobian,
+        n2_override=pn2, e3w_override=e3w)
+    nmln = jnp.clip(m_base + 1, 1, nlev - 1) + 1
+    mbkt = jnp.sum(act > 0.5, axis=-1).astype(jnp.int32)
+    # ldfslp's coastal factor, which ldfeke divides back out (ldfeke.F90:220).
+    umask3, vmask3, _ = nemo_iso_face_masks(u_mask, v_mask, act)
+    zck = (0.25 * (umask3 + jnp.roll(umask3, +1, axis=1))
+           * (vmask3 + jnp.roll(vmask3, +1, axis=0)))
+    sf_w = ml_geometric_structure_function_w(pn2_k, nmln, mbkt, ml)
+    zn, zn_slp = ml_geometric_column_integrals(
+        pn2_k, wslpi, wslpj, zck, sf_w, jnp.broadcast_to(e3w_k, T.shape), act)
+    e3t = z_coord.dz_ref[None, None, :] * jacobian[:, :, jnp.newaxis]
+    eke_int = ml_geometric_depth_integrated_eke(
+        eke_sfc, ml_geometric_structure_function_t(sf_w, mbkt), e3t, act)
+    kappa_sfc = ml_geometric_kappa_surface(
+        eke_int, zn_slp, zn, H_bathy, f_coriolis, omega, act[..., 0], ml)
+    return ml_geometric_kappa_t(
+        ml_geometric_kappa_w(kappa_sfc, sf_w, wmask3), wmask3, act)
+
+
 def gm_redi_tracer_tendency_latlon(
     T: jnp.ndarray,
     S: jnp.ndarray,
@@ -4048,6 +4146,7 @@ def gm_redi_tracer_tendency_latlon(
     native_kappa_slope_eta: jnp.ndarray | None = None,
     native_bolus_slope_eta: jnp.ndarray | None = None,
     redi_flux_eta: jnp.ndarray | None = None,
+    ml_geometric_eke_sfc: jnp.ndarray | None = None,
     dt: float | None = None,
     return_bolus_transport: bool = False,
     return_redi_diagnostics: bool = False, return_redi_slope_diagnostics: bool = False, native_slope_nmln_override: jnp.ndarray | None = None,
@@ -4089,6 +4188,10 @@ def gm_redi_tracer_tendency_latlon(
         ``grid``/``f_coriolis`` (see :func:`compute_treguier_kappa_gm_nemo_native`)
         — only the Treguier ``gm_kappa_scheme="treguier"`` path reads it, for
         the ``f20`` tropical-taper reference (#1226).
+    ml_geometric_eke_sfc : (n_lat, n_lon) or None
+        SURFACE EKE [m²/s²] for ``cfg.eke.closure == "ml_geometric"``
+        (required then, rejected otherwise): the 3-D GM coefficient is built
+        from it by :func:`native_ml_geometric_kappa_for_state`.
     eos_depth : str, default ``"insitu"``
         Forwarded to :func:`gm_redi_density_and_jacobian` (see its docstring)
         when ``density_jacobian`` is not already hoisted.  Ignored when
@@ -4184,7 +4287,27 @@ def gm_redi_tracer_tendency_latlon(
         # Concrete-value check only (skipped for a trained/traced aei0); the
         # kappa_min <= aei0 invariant itself is enforced in the kernels.
         validate_treguier_cfg(_treg)
-    if kappa_gm_override is not None:
+    _eke_cfg = getattr(cfg, "eke", None)
+    _ml_geometric = _eke_cfg is not None and _eke_cfg.closure == "ml_geometric"
+    if _ml_geometric != (ml_geometric_eke_sfc is not None):
+        raise ValueError(
+            "ml_geometric_eke_sfc must be given exactly when "
+            "GMRediConfig.eke.closure='ml_geometric'")
+    if _ml_geometric:
+        validate_ml_geometric_gm_config(cfg)
+        if kappa_gm_override is not None:
+            raise ValueError(
+                "EKEConfig.closure='ml_geometric' builds kappa_GM itself; "
+                "a kappa_gm_override would be silently dropped")
+        if f_coriolis is None:
+            f_coriolis = jnp.broadcast_to(grid.f, mask.shape)
+        kappa_GM = native_ml_geometric_kappa_for_state(
+            rho, T, S, mask, u_mask, v_mask, z_coord, grid, cfg, eos_fn,
+            jacobian, _kappa_native_eta, H_bathy, _native_prd_J,
+            native_prd_TS, native_slope_pn2, native_slope_e3w,
+            f_coriolis, rho_0, g, omega, ml_geometric_eke_sfc,
+        )
+    elif kappa_gm_override is not None:
         kappa_GM = kappa_gm_override
     elif _treg is not None and _treg.enabled:
         # Treguier-1997 / NEMO nn_aei_ijk_t=21 adaptive κ (the oracle scaling).

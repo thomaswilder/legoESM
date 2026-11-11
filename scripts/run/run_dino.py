@@ -216,15 +216,34 @@ def _parse_args():
              "combination is rejected). Lat-lon only; MPAS is tracer-only.",
     )
     p.add_argument(
-        "--gm-kappa-scheme", choices=("visbeck", "treguier", "geometric"),
+        "--gm-kappa-scheme",
+        choices=("visbeck", "treguier", "geometric", "ml_geometric"),
         default=None,
         help="Adaptive kappa_GM scaling (DINOConfig.gm_kappa_scheme): "
              "'visbeck' (Visbeck 1997, historical default), 'treguier' "
              "(Treguier 1997 / NEMO nn_aei_ijk_t=21 — the DINO oracle "
              "scaling, cap aei0=0.5*rn_Ue*rn_Le=1500 m2/s, ldftra.F90:332), "
-             "or 'geometric' (Torres et al. 2025 / Marshall et al. 2012 "
-             "prognostic 2-D GEOMETRIC EKE closure). Lat-lon only.",
+             "'geometric' (Torres et al. 2025 / Marshall et al. 2012 "
+             "prognostic 2-D GEOMETRIC EKE closure), or 'ml_geometric' (a "
+             "U-Net predicts surface EKE once a model day; GEOMETRIC kappa(z) "
+             "from it, the user's NEMO ldfeke.F90 ML branch; needs the "
+             "--ml-geometric-* values). Lat-lon only.",
     )
+    for _name, _type, _help in (
+        ("alpha", float, "rn_geom, GEOMETRIC master coefficient"),
+        ("sf-min", float, "rn_SFmin, structure-function floor"),
+        ("sf-max", float, "rn_SFmax, structure-function cap"),
+        ("ross-min-m", float, "rn_ross_min, Rossby-radius taper centre [m]"),
+        ("kappa-min", float, "rn_aeiv_min, kappa floor [m2/s]"),
+        ("kappa-max", float, "rn_aeiv_max, kappa cap [m2/s]"),
+        ("weights", str, "U-Net weights .npz (convert_eke_unet_keras_to_npz)"),
+        ("wall-halo", int, "wall-fill halo width of the U-Net land fill"),
+    ):
+        p.add_argument(
+            f"--ml-geometric-{_name}", type=_type, default=None,
+            help=f"ML-GEOMETRIC {_help} (DINOConfig.ml_geometric_"
+                 f"{_name.replace('-', '_')}; no default). Ignored unless "
+                 "--gm-kappa-scheme ml_geometric.")
     p.add_argument(
         "--geometric-alpha", type=float, default=None,
         help="GEOMETRIC eddy efficiency alpha (DINOConfig.geometric_alpha, "
@@ -662,6 +681,11 @@ def build_run(args):
     if args.geometric_e0_per_depth is not None:
         cfg = dataclasses.replace(
             cfg, geometric_e0_per_depth=args.geometric_e0_per_depth)
+    for _f in ("alpha", "sf_min", "sf_max", "ross_min_m", "kappa_min",
+               "kappa_max", "weights", "wall_halo"):
+        _v = getattr(args, f"ml_geometric_{_f}")
+        if _v is not None:
+            cfg = dataclasses.replace(cfg, **{f"ml_geometric_{_f}": _v})
     if args.n_barotropic_substeps is not None:
         cfg = dataclasses.replace(
             cfg, n_barotropic_substeps=args.n_barotropic_substeps)
@@ -818,6 +842,32 @@ def build_run(args):
         sf_step = None
         grid_desc = f"{grid.nCells} cells MPAS regional Voronoi"
 
+    # ML-GEOMETRIC: the U-Net writes surface EKE into state.eke once a model
+    # day, outside the jitted step (refresh_eke; main and the gradient
+    # check call it at each day start). Done once here so the initial state
+    # carries it before any scan seeding.
+    net = refresh_eke = steps_per_day = None
+    if cfg.use_gm_redi and cfg.gm_kappa_scheme == "ml_geometric":
+        from legoesm.ml.eke_unet import load_eke_unet, wall_fill_index
+        from legoesm.ocean.experiments.dino import ml_geometric_refresh_eke
+        if cfg.ml_geometric_weights is None or cfg.ml_geometric_wall_halo is None:
+            raise SystemExit(
+                "--gm-kappa-scheme ml_geometric needs --ml-geometric-weights "
+                "and --ml-geometric-wall-halo.")
+        if (86400.0 / dt) != round(86400.0 / dt):
+            raise SystemExit(
+                f"ml_geometric calls the U-Net once a model day: dt={dt} s "
+                "must divide 86400 s.")
+        steps_per_day = int(round(86400.0 / dt))
+        net = load_eke_unet(cfg.ml_geometric_weights)
+        _fill = wall_fill_index(np.asarray(state.land_mask.data),
+                                cfg.ml_geometric_wall_halo)
+
+        def refresh_eke(s, net=net):
+            return ml_geometric_refresh_eke(s, net, grid, _fill)
+
+        state = refresh_eke(state)
+
     # The rigid_lid faithful stack uses the ab2 outer integrator + a
     # streamfunction (ψ, dψ, dψ_prev, dpsin, dpsin_prev) carry; seed them (and
     # the rigid-lid island cache + dtype reconciliation) once from the concrete
@@ -852,7 +902,8 @@ def build_run(args):
         cfg=cfg, dt=dt, grid_kind=grid_kind, grid=grid, z=z, state=state,
         model_cfg=model_cfg, model=model, forcing=forcing,
         apply_forcing=apply_forcing, sf_step=sf_step, grid_desc=grid_desc,
-        sf_placement=_sf_placement)
+        sf_placement=_sf_placement, net=net, refresh_eke=refresh_eke,
+        steps_per_day=steps_per_day)
 
 
 def advance(run, state, k, model=None):
@@ -913,6 +964,8 @@ def main():
     _save_snapshot(state, 0.0, snapshot_dir, snapshot_idx, grid_kind)
 
     for k in range(n_steps_total):
+        if run.refresh_eke is not None and k % run.steps_per_day == 0:
+            state = run.refresh_eke(state)   # ML-GEOMETRIC: once a model day
         state = advance(run, state, k)
 
         is_last = (k == n_steps_total - 1)

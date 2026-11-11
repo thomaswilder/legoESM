@@ -348,6 +348,11 @@ BASELINE_DISPATCHERS: frozenset[tuple[str, str]] = frozenset(
         # silently fall through to _step_impl (the else branch) instead of
         # raising -- lock the guard so it can't be silently deleted.
         ("packages/ocean/legoesm/ocean/dynamics/ocean_model_latlon_cgrid.py", "_step_jitted"),
+        # EKEConfig.closure dispatch in the step and the scan-carry seed
+        # (eden_greatbatch | geometric | ml_geometric): a new closure literal
+        # used to fall into a bare else and silently run Eden-Greatbatch.
+        ("packages/ocean/legoesm/ocean/dynamics/ocean_model_latlon_cgrid.py", "_step_impl"),
+        ("packages/ocean/legoesm/ocean/dynamics/ocean_model_latlon_cgrid.py", "seed_scan_carry"),
         ("packages/ocean/legoesm/ocean/dynamics/ocean_model_mpas.py", "__init__"),
         ("packages/ocean/legoesm/ocean/dynamics/ocean_pe_cdgrid.py", "ocean_baroclinic_tendencies_cdgrid"),
         ("packages/ocean/legoesm/ocean/dynamics/ocean_pe_latlon_cgrid.py", "_bc_ke_and_pressure_gradients"),
@@ -378,6 +383,9 @@ BASELINE_DISPATCHERS: frozenset[tuple[str, str]] = frozenset(
         # lateral_tracer_mixing, gm_redi_mld_criterion) with fn-entry raises;
         # lock so the gm_redi_mld_criterion N2-integral guard can't be dropped.
         ("packages/ocean/legoesm/ocean/experiments/dino.py", "dino_lat_lon_model_config"),
+        # gm_kappa_scheme guard where the initial state is seeded (only
+        # geometric seeds eke; ml_geometric's comes from the U-Net).
+        ("packages/ocean/legoesm/ocean/experiments/dino.py", "dino_lat_lon_state"),
         # MPAS DINO builder rejects the lat-lon-C-grid-only scheme fields
         # (gm_kappa_scheme=treguier, convection_evd_n2_time_level=
         # nemo_now_before). The MPAS vmix bridge threads neither the Nnn/Nbb
@@ -389,6 +397,9 @@ BASELINE_DISPATCHERS: frozenset[tuple[str, str]] = frozenset(
         # the canonical guard is validate_bottom_drag_scheme above.
         ("packages/ocean/legoesm/ocean/physics/convection/integration.py", "make_convection_physics"),
         ("packages/ocean/legoesm/ocean/physics/lateral_mixing/gm_redi_latlon_cgrid.py", "gm_redi_tracer_tendency_latlon"),
+        # EKEConfig.closure membership (eden_greatbatch | geometric |
+        # ml_geometric), checked at model construction.
+        ("packages/ocean/legoesm/ocean/physics/lateral_mixing/eke.py", "validate_eke_config"),
         # gm_bolus_advection dispatch (centred | through_fct; hardened 2026-07-18
         # with the NEMO ldf_eiv_trp bolus-through-FCT option — a typo would
         # silently drop the GM bolus from BOTH paths).

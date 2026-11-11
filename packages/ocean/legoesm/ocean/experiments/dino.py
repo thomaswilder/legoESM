@@ -686,6 +686,20 @@ class DINOConfig:
     treguier_aei0: float = 1500.0  # Treguier κ cap [m²/s] = 0.5·rn_Ue·rn_Le (ldftra.F90:332)
     geometric_alpha: float = 0.04  # GEOMETRIC eddy efficiency α (Torres et al. 2025 Eq. 6)
     geometric_e0_per_depth: float = 1.0e-6  # GEOMETRIC cold-start ∫EKE dz / H [m²/s²]
+    # gm_kappa_scheme="ml_geometric" (U-Net surface EKE -> GEOMETRIC kappa(z),
+    # the user's NEMO ldfeke.F90 ML branch). The six namelist values
+    # (&namldf_eke) have NO default: None is rejected when the scheme is on.
+    ml_geometric_alpha: float | None = None      # rn_geom [1]
+    ml_geometric_sf_min: float | None = None     # rn_SFmin [1]
+    ml_geometric_sf_max: float | None = None     # rn_SFmax [1]
+    ml_geometric_ross_min_m: float | None = None  # rn_ross_min [m]
+    ml_geometric_kappa_min: float | None = None  # rn_aeiv_min [m²/s]
+    ml_geometric_kappa_max: float | None = None  # rn_aeiv_max [m²/s]
+    # U-Net weights (.npz from scripts/data/convert_eke_unet_keras_to_npz.py)
+    # and the wall-fill halo width of its land fill (ml_models HALO). Read by
+    # the run driver only (the network runs outside the model step).
+    ml_geometric_weights: str | None = None
+    ml_geometric_wall_halo: int | None = None
     visbeck_alpha: float = 0.015   # Visbeck dimensionless prefactor
     visbeck_kappa_min: float = 200.0      # κ_GM floor [m²/s]
     visbeck_kappa_max: float = 2000.0     # κ_GM ceiling [m²/s]
@@ -3370,6 +3384,55 @@ def dino_lat_lon_initial_state_arrays(
     return T, S, H_bathy, land_mask
 
 
+# DINOConfig field -> its &namldf_eke namelist name (ldfeke.F90).
+_ML_GEOMETRIC_NAMELIST = {
+    "ml_geometric_alpha": "rn_geom",
+    "ml_geometric_sf_min": "rn_SFmin",
+    "ml_geometric_sf_max": "rn_SFmax",
+    "ml_geometric_ross_min_m": "rn_ross_min",
+    "ml_geometric_kappa_min": "rn_aeiv_min",
+    "ml_geometric_kappa_max": "rn_aeiv_max",
+}
+
+
+def dino_ml_geometric_config(cfg: DINOConfig):
+    """The :class:`MLGeometricConfig` of ``cfg``; raises naming every unset
+    namelist value (they have no default)."""
+    from legoesm.ocean.physics.lateral_mixing.eke import MLGeometricConfig
+    missing = [f"{k} ({v})" for k, v in _ML_GEOMETRIC_NAMELIST.items()
+               if getattr(cfg, k) is None]
+    if missing:
+        raise ValueError(
+            "gm_kappa_scheme='ml_geometric' needs the &namldf_eke namelist "
+            f"values; not set: {', '.join(missing)}")
+    return MLGeometricConfig(
+        alpha=float(cfg.ml_geometric_alpha),
+        sf_min=float(cfg.ml_geometric_sf_min),
+        sf_max=float(cfg.ml_geometric_sf_max),
+        ross_min_m=float(cfg.ml_geometric_ross_min_m),
+        kappa_min=float(cfg.ml_geometric_kappa_min),
+        kappa_max=float(cfg.ml_geometric_kappa_max),
+    )
+
+
+def ml_geometric_refresh_eke(state, net, grid, fill_index):
+    """Write the U-Net's surface EKE [m²/s²] into ``state.eke`` (ML-GEOMETRIC).
+
+    Called by the run driver once per model day, OUTSIDE the jitted step;
+    differentiable w.r.t. ``net``. Input: surface relative vorticity / f from
+    ``state``'s velocities. ``fill_index`` from
+    :func:`legoesm.ml.eke_unet.wall_fill_index` on the surface land mask
+    (host-side, built once). The lat-lon C-grid is zonally periodic (every
+    x stencil rolls), so the network wraps in x.
+    """
+    from legoesm.ml.eke_unet import predict_eke, surface_vorticity_over_f
+    mask = state.land_mask.data
+    vor = surface_vorticity_over_f(state.u.data, state.v.data, grid)
+    eke = predict_eke(net, vor, mask, fill_index, periodic_x=True) * mask
+    return state._replace(eke=Field(data=eke, name="eke", dims=("lat", "lon"),
+                                    units="m^2/s^2"))
+
+
 def dino_lat_lon_state(
     grid,
     z_coord: OceanZStarCoordinate,
@@ -3425,6 +3488,12 @@ def dino_lat_lon_state(
         T=Field(data=T, name="T", dims=state.T.dims, units=state.T.units),
         S=Field(data=S, name="S", dims=state.S.dims, units=state.S.units),
     )
+    if cfg.use_gm_redi and cfg.gm_kappa_scheme not in (
+            "visbeck", "treguier", "geometric", "ml_geometric"):
+        raise ValueError(
+            f"unknown DINOConfig.gm_kappa_scheme {cfg.gm_kappa_scheme!r}")
+    # ml_geometric: no seed — state.eke (surface EKE) is written by the U-Net
+    # before the first step (run_dino); the model raises if it is missing.
     if cfg.use_gm_redi and cfg.gm_kappa_scheme == "geometric":
         eke0 = cfg.geometric_e0_per_depth * H_bathy * land_mask
         state = state._replace(
@@ -3646,10 +3715,11 @@ def dino_lat_lon_model_config(
     from legoesm.ocean.physics.lateral_mixing.eke import (
         __param_spec__ as _eke_param_spec,
     )
-    if cfg.gm_kappa_scheme not in ("visbeck", "treguier", "geometric"):
+    if cfg.gm_kappa_scheme not in (
+            "visbeck", "treguier", "geometric", "ml_geometric"):
         raise ValueError(
             f"unknown DINOConfig.gm_kappa_scheme {cfg.gm_kappa_scheme!r}; "
-            "expected 'visbeck', 'treguier', or 'geometric'")
+            "expected 'visbeck', 'treguier', 'geometric' or 'ml_geometric'")
     # The spec's bounds are the one declared range for alpha (user decision
     # 2026-11-09: reject outside it rather than run).
     _lo, _hi = _eke_param_spec["GeometricConfig"]["params"]["alpha"]["bounds"]
@@ -3669,6 +3739,9 @@ def dino_lat_lon_model_config(
         if (cfg.use_gm_redi and cfg.gm_kappa_scheme == "geometric")
         else None
     )
+    if cfg.use_gm_redi and cfg.gm_kappa_scheme == "ml_geometric":
+        _eke_cfg = EKEConfig(closure="ml_geometric",
+                             ml_geometric=dino_ml_geometric_config(cfg))
     if _eke_cfg is not None:
         validate_eke_config(_eke_cfg)
     if cfg.gm_redi_slope_n2 not in ("adiabatic", "nemo_bn2"):

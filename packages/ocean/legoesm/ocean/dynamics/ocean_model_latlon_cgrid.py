@@ -118,6 +118,7 @@ from legoesm.ocean.physics.lateral_mixing.gm_redi_latlon_cgrid import (
     eke_3d_vertical_diffusion,
     gm_redi_tracer_tendency_latlon,
     validate_redi_coefficient,
+    validate_ml_geometric_gm_config,
     gm_redi_density_and_jacobian,
     harmonic_lateral_kediss_eke_source,
     compute_isoneutral_K33_latlon,
@@ -3809,6 +3810,8 @@ class LatLonCGridOceanModel:
             from legoesm.ocean.physics.lateral_mixing.eke import validate_eke_config
             _eke = config.gm_redi.eke
             validate_eke_config(_eke)
+            if _eke.closure == "ml_geometric":
+                validate_ml_geometric_gm_config(config.gm_redi)
             if not _eke.eke_3d and (
                 _eke.source_kdiss_h or _eke.gm_source_mode != "parameterized"
                 or _eke.source_p_diss_iso
@@ -8854,6 +8857,7 @@ class LatLonCGridOceanModel:
                 gm_cfg, _grid)
             eke_new = None
             eke_diss_new = None
+            _ml_eke_sfc = None
             # Prognostic-EKE GM closure (Eden-Greatbatch): kappa_GM = c_k·L·√E
             # from the evolving eddy-energy field, and integrate E one step
             # (transport by the depth-mean flow + semi-implicit source/sink).
@@ -8964,7 +8968,19 @@ class LatLonCGridOceanModel:
                     if geom.kappa_n_coupling:
                         kappa_redi_override = kappa_n_geom
                         kappa_redi_v_override = None
-                else:
+                elif eke_cfg.closure == "ml_geometric":
+                    # ML-GEOMETRIC (user's NEMO ldfeke.F90 ML branch): no
+                    # budget. state.eke is the U-Net's SURFACE EKE, written
+                    # outside the step and carried through unchanged
+                    # (eke_new stays None); the GM/Redi tendency builds the
+                    # 3-D coefficient from it on its native slopes.
+                    if state.eke is None:
+                        raise ValueError(
+                            "EKEConfig.closure='ml_geometric' needs "
+                            "state.eke (surface EKE from the U-Net) before "
+                            "the first step; there is no cold-start seed.")
+                    _ml_eke_sfc = state.eke.data
+                elif eke_cfg.closure == "eden_greatbatch":
                     if state.eke is not None:
                         E = state.eke.data
                     else:
@@ -8994,6 +9010,10 @@ class LatLonCGridOceanModel:
                                                    production_scale=_resfn_scale)
                     eke_new = Field(data=E_new * lm, name="eke",
                                     dims=("lat", "lon"), units="m^2/s^2")
+                else:
+                    raise ValueError(
+                        "unknown EKEConfig.closure scheme "
+                        f"{eke_cfg.closure!r}")
                 # K_iso = K_gm (Veros enable_eke_isopycnal_diffusion): drive the
                 # Redi tracer diffusivity from the same prognostic kappa as GM.
                 # kappa_gm_override is a T-point field -> clear any stale
@@ -9127,6 +9147,7 @@ class LatLonCGridOceanModel:
                 native_bolus_slope_eta=_eta_gm_in,
                 # tra_ldf e3u/e3v use the step-entry Nnn SSH (Kmm).
                 redi_flux_eta=state.eta.data,
+                ml_geometric_eke_sfc=_ml_eke_sfc,
                 return_bolus_transport=_want_bolus,
                 return_redi_diagnostics=(_return_tracer_process_trace and self._nemo_ws_test_hooks.tracer_ldf_diagnostics is not None), return_redi_slope_diagnostics=(_return_tracer_process_trace and (self._nemo_ws_test_hooks.tracer_ldf_diagnostics == "slope" or isinstance(self._nemo_ws_test_hooks.tracer_ldf_diagnostics, dict))), native_slope_nmln_override=(self._nemo_ws_test_hooks.tracer_ldf_diagnostics.get("nmln") if isinstance(self._nemo_ws_test_hooks.tracer_ldf_diagnostics, dict) else None),
                 redi_face_thickness_override=(self._nemo_ws_test_hooks.tracer_ldf_diagnostics if isinstance(self._nemo_ws_test_hooks.tracer_ldf_diagnostics, tuple) else None),
@@ -15651,10 +15672,21 @@ class LatLonCGridOceanModel:
                 )
                 eke_dims = ("lat", "lon")
                 eke_units = "m^3/s^2"
-            else:
+            elif gm_redi.eke.closure == "ml_geometric":
+                # No seed: the surface EKE comes only from the U-Net, written
+                # into state.eke before the first step.
+                raise ValueError(
+                    "EKEConfig.closure='ml_geometric' needs state.eke (surface "
+                    "EKE from the U-Net) before the scan; there is no "
+                    "cold-start seed.")
+            elif gm_redi.eke.closure == "eden_greatbatch":
                 eke0 = e_min * lm
                 eke_dims = ("lat", "lon")
                 eke_units = "m^2/s^2"
+            else:
+                raise ValueError(
+                    "unknown EKEConfig.closure scheme "
+                    f"{gm_redi.eke.closure!r}")
             state = state._replace(
                 eke=Field(data=eke0, name="eke", dims=eke_dims,
                           units=eke_units))

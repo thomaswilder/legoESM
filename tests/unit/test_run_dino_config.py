@@ -684,3 +684,37 @@ def test_nemo_channel_rows_flag_rejects_unknown_and_needs_faithful_grid(
             rd.main()
     finally:
         set_policy(prev)
+
+
+def test_ml_geometric_flags_round_trip_to_config(monkeypatch):
+    argv = ["--gm-kappa-scheme", "ml_geometric",
+            "--ml-geometric-alpha", "0.04", "--ml-geometric-sf-min", "0.1",
+            "--ml-geometric-sf-max", "1.0", "--ml-geometric-ross-min-m", "2e3",
+            "--ml-geometric-kappa-min", "10", "--ml-geometric-kappa-max", "3e3",
+            "--ml-geometric-weights", "w.npz", "--ml-geometric-wall-halo", "5"]
+    cfg = _resolved_cfg(monkeypatch, argv)
+    assert cfg.gm_kappa_scheme == "ml_geometric"
+    assert (cfg.ml_geometric_alpha, cfg.ml_geometric_sf_min,
+            cfg.ml_geometric_sf_max, cfg.ml_geometric_ross_min_m,
+            cfg.ml_geometric_kappa_min, cfg.ml_geometric_kappa_max) == (
+        0.04, 0.1, 1.0, 2e3, 10.0, 3e3)
+    assert (cfg.ml_geometric_weights, cfg.ml_geometric_wall_halo) == ("w.npz", 5)
+    # unset flags leave the (None) defaults alone
+    cfg = _resolved_cfg(monkeypatch, [])
+    assert cfg.ml_geometric_alpha is None and cfg.ml_geometric_weights is None
+
+
+def test_ml_geometric_deck_carries_namelist_values(monkeypatch):
+    y = _REPO / "scripts" / "experiment" / "dino" / \
+        "nemo_faithful_kamm_mlf_ml_geometric.yaml"
+    monkeypatch.setattr(sys, "argv", ["run_dino", "--config", str(y)])
+    args = rd._parse_args()
+    assert args.gm_kappa_scheme == "ml_geometric"
+    # nemo-fortran-heritage/namelist_cfg &namldf_eke
+    assert (args.ml_geometric_alpha, args.ml_geometric_sf_min,
+            args.ml_geometric_sf_max, args.ml_geometric_ross_min_m,
+            args.ml_geometric_kappa_min, args.ml_geometric_kappa_max) == (
+        0.06, 1.0, 1.0, 7.0e3, 10.0, 3.0e4)
+    assert args.nemo_channel_rows == "ai4pex" and args.nemo_resolution == "R1"
+    assert args.ml_geometric_wall_halo is None
+    assert args.dt == 2700.0 and args.recipe == "nemo_dino_kamm_mlf"

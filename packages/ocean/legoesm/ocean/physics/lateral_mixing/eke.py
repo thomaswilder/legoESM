@@ -9,6 +9,10 @@ Two selectable closures (``EKEConfig.closure``):
    GEOMETRIC ``kappa_gm = alpha·∫EKE dz / ∫(M²/N) dz`` of Mak, Marshall et
    al. 2022 / D. P. Marshall et al. 2012, with EKE in place of total eddy
    energy).  Depth-INTEGRATED 2-D budget — see :class:`GeometricConfig`.
+   ``"ml_geometric"`` — no budget: a U-Net predicts SURFACE EKE, projected
+   over depth by a structure function into a depth-varying GM coefficient
+   (port of the user's NEMO ``ldfeke.F90`` ML block) — see
+   :class:`MLGeometricConfig`.
 3. #TODO Add in the scale-aware GEOMETRIC from Mak et al. (2023).
 
 Eden & Greatbatch (2008): a 2-D (depth-integrated) eddy-energy field ``E``
@@ -46,6 +50,8 @@ from __future__ import annotations
 from typing import NamedTuple
 
 import jax.numpy as jnp
+
+from legoesm.core.profile_metrics import safe_sqrt
 
 
 __physics_contract__ = {
@@ -227,6 +233,51 @@ class GeometricConfig(NamedTuple):
     e0_per_depth: float = 1.0e-6
 
 
+# --- ML-GEOMETRIC fixed numbers (user's NEMO ldfeke.F90, ML-GEOMETRIC branch) ---
+# Floor on the reference N^2 of the structure function [1/s^2] (zn2_min, :135).
+ML_GEOMETRIC_N2_MIN = 1.0e-8
+# Floor on the denominator ∫SF·sqrt(N^2 slope^2) dz [m/s] (:551).
+ML_GEOMETRIC_DENOM_FLOOR = 1.0e-10
+# Floor on |f| in the Rossby radius [1/s] (:548).
+ML_GEOMETRIC_F_FLOOR = 1.0e-10
+# Floor on the coastal slope-reduction factor zck it divides by (:223-227).
+ML_GEOMETRIC_SLOPE_MASK_FLOOR = 0.1
+# Rossby radius = this · ∫N dz / |f| (:549; 0.5 is NEMO v4's factor).
+ML_GEOMETRIC_ROSSBY_FACTOR = 0.5
+# Coastal taper 0.5·(1 - tanh((-H + depth)/width)) [m] (:555).
+ML_GEOMETRIC_COAST_DEPTH_M = 800.0
+ML_GEOMETRIC_COAST_WIDTH_M = 300.0
+# Rossby-radius taper 0.5·(1 + tanh((R - ross_min)·rate)) [1/m] (:557).
+ML_GEOMETRIC_ROSSBY_TAPER_RATE = 0.5
+# Tropical decrease min(1, |f / f(this latitude)|) [deg] (:545, :558).
+ML_GEOMETRIC_TROPICAL_LAT_DEG = 20.0
+
+
+class MLGeometricConfig(NamedTuple):
+    """ML-GEOMETRIC: GEOMETRIC GM coefficient from a U-Net's SURFACE EKE.
+
+    Port of the ``ln_eke_equ_ml`` branch of the user's NEMO ``ldfeke.F90``
+    (``nemo-fortran-heritage/ldfeke.F90``). No EKE budget: an external
+    network writes surface EKE [m²/s²] into ``state.eke`` (once a model day,
+    outside the step); the step projects it over depth with the structure
+    function ``SF = N²/N²(one level below the mixed layer)`` and forms
+
+        kappa_sfc = alpha·∑ EKE·SF_t·e3t / max(1e-10, ∑ SF_w·sqrt(N² slope²)·e3w)
+
+    then caps, tapers and floors it and spreads it as ``kappa_sfc·SF_w(z)``.
+
+    All six fields are the namelist values (``&namldf_eke``) and have NO
+    default: they must come from the run's namelist.
+    """
+
+    alpha: float       # rn_geom, GEOMETRIC master coefficient [1]
+    sf_min: float      # rn_SFmin, structure-function floor [1]
+    sf_max: float      # rn_SFmax, structure-function cap (and ML value) [1]
+    ross_min_m: float  # rn_ross_min, Rossby-radius taper centre [m]
+    kappa_min: float   # rn_aeiv_min, floor on the surface coefficient [m²/s]
+    kappa_max: float   # rn_aeiv_max, cap on the surface coefficient [m²/s]
+
+
 class EKEConfig(NamedTuple):
     """Prognostic EKE closure parameters (Eden & Greatbatch 2008)."""
 
@@ -361,6 +412,8 @@ class EKEConfig(NamedTuple):
     #   the EG-specific knobs c_k/c_eps/mixing_length/source-augmentation are
     #   unused).  The prognostic ``state.eke`` field then carries ∫EKE dz
     #   [m³/s²] (depth-integrated), NOT the EG specific energy [m²/s²].
+    # "ml_geometric": U-Net surface EKE -> depth-varying GEOMETRIC kappa
+    #   (requires ``ml_geometric`` below; no budget, state.eke = SURFACE EKE).
     closure: str = "eden_greatbatch"
     # GEOMETRIC closure parameters (Torres et al. 2025); must be a
     # :class:`GeometricConfig` when ``closure="geometric"`` and None otherwise
@@ -375,6 +428,11 @@ class EKEConfig(NamedTuple):
     # On a Veros u_centered coordinate the two alternate by up to ±50% per
     # level. Default False ⇒ BIT-IDENTICAL.
     n2_over_dzw: bool = False
+    # ML-GEOMETRIC parameters; must be an :class:`MLGeometricConfig` when
+    # ``closure="ml_geometric"`` and None otherwise (appended last).  Under
+    # that closure ``state.eke`` holds SURFACE EKE [m²/s²], written by the
+    # U-Net outside the step and only read by it.
+    ml_geometric: MLGeometricConfig | None = None
 
 
 def eke_mixing_length(L_rossby: jnp.ndarray, cfg: EKEConfig) -> jnp.ndarray:
@@ -736,6 +794,144 @@ def geometric_dissipation_length(
     return r_d * jnp.sqrt(jnp.maximum(H_col, 0.0) + 1.0e-30)
 
 
+# ---------------------------------------------------------------------------
+# ML-GEOMETRIC (user's NEMO ldfeke.F90, ln_eke_equ_ml branch) — pure column
+# formulas. Columns run along the LAST axis, W index k = top of T cell k
+# (k = 0 the sea surface; Fortran jk = k + 1). ``nmln`` and ``mbkt`` are
+# NEMO's own 1-based integers: the mixed-layer W level and the bottom wet T
+# level (= number of wet cells). Line numbers are ldfeke.F90's.
+# ---------------------------------------------------------------------------
+
+
+def ml_geometric_structure_function_w(n2_w, nmln, mbkt, ml: MLGeometricConfig):
+    """Structure function on W levels (:176-185), as written:
+
+        SF(jk) = sf_max                                   jk <= nmln
+               = clip(max(0, N²(jk)) / max(1e-8, N²(ik)), sf_min, sf_max)  below
+        ik     = MIN(nmln, mbkt) + 1   (one level below the mixed layer)
+
+    and SF = 0 at the sea surface (the Fortran loop starts at jk = 2). The
+    loop is not masked; every consumer masks. ``n2_w`` is rn2b at W levels.
+    """
+    nlev = n2_w.shape[-1]
+    k = jnp.arange(nlev)
+    ik = jnp.clip(jnp.minimum(nmln, mbkt), 0, nlev - 1)  # 0-based index of ik
+    n2_ref = jnp.take_along_axis(n2_w, ik[..., None], axis=-1)
+    sf = jnp.maximum(n2_w, 0.0) / jnp.maximum(ML_GEOMETRIC_N2_MIN, n2_ref)
+    sf = jnp.maximum(ml.sf_min, jnp.minimum(sf, ml.sf_max))
+    sf = jnp.where(k + 1 <= nmln[..., None], ml.sf_max, sf)
+    return jnp.where(k == 0, 0.0, sf)
+
+
+def ml_geometric_structure_function_t(sf_w, mbkt):
+    """Structure function on T levels (:510-523), as written:
+    ``0.5·(SF_w(jk) + SF_w(jk+1))`` for ``jk < mbkt``, else 0 — so the top
+    cell gets half weight (SF_w = 0 at the surface) and the bottom wet cell
+    gets zero."""
+    nlev = sf_w.shape[-1]
+    below = jnp.concatenate([sf_w[..., 1:], jnp.zeros_like(sf_w[..., :1])],
+                            axis=-1)
+    k = jnp.arange(nlev)
+    return jnp.where(k + 1 < mbkt[..., None], 0.5 * (sf_w + below), 0.0)
+
+
+def ml_geometric_depth_integrated_eke(eke_sfc, sf_t, e3t, tmask):
+    """∫EKE dz = ∑_k EKE_sfc·SF_t·e3t·tmask, times the surface tmask
+    (:525-531) [m³/s²]."""
+    return (jnp.sum(eke_sfc[..., None] * sf_t * e3t * tmask, axis=-1)
+            * tmask[..., 0])
+
+
+def ml_geometric_column_integrals(n2_w, wslpi, wslpj, zck, sf_w, e3w, tmask):
+    """Column sums over W levels jk >= 2 (:193-232), returning ``(zn, zn_slp)``:
+
+        zn     = ∑ sqrt(N²⁺)·e3w·tmask                       [m/s]
+        zn_slp = ∑ e3w·tmask·SF_w·sqrt(N²⁺·(si² + sj²))      [m/s]
+        si     = wslpi / max(zck, 0.1)    (topographic slope reduction undone)
+
+    ``zck`` is ldfslp's coastal factor 0.25·(u faces wet)·(v faces wet) at
+    each W level. The square roots are guarded (finite gradient at 0).
+    """
+    n2 = jnp.maximum(n2_w, 0.0)[..., 1:]
+    ze3w = (e3w * tmask)[..., 1:]
+    zck = jnp.maximum(zck, ML_GEOMETRIC_SLOPE_MASK_FLOOR)[..., 1:]
+    si = wslpi[..., 1:] / zck
+    sj = wslpj[..., 1:] / zck
+    zn = jnp.sum(safe_sqrt(n2) * ze3w, axis=-1)
+    zn_slp = jnp.sum(ze3w * sf_w[..., 1:] * safe_sqrt(n2 * (si * si + sj * sj)),
+                     axis=-1)
+    return zn, zn_slp
+
+
+def ml_geometric_kappa_surface(eke_int, zn_slp, zn, ht_0, f_t, omega,
+                               tmask_sfc, ml: MLGeometricConfig):
+    """Surface GM coefficient (:545-559), as written:
+
+        k = alpha·∫EKE dz / max(1e-10, zn_slp)·tmask, capped at kappa_max,
+            × 0.5·(1 - tanh((-H + 800)/300))            coastal taper
+            × 0.5·(1 + tanh((R - ross_min)·0.5))        Rossby taper (R in m:
+                                                         a hard switch)
+            × min(1, |f / f(20°)|)                       tropical decrease,
+        then floored at kappa_min (land included: masked later by wmask).
+
+    ``R = 0.5·zn/max(|f|, 1e-10)``; ``ht_0`` the rest water depth [m];
+    ``omega`` the rotation rate that built ``f_t``.
+    """
+    zross = ML_GEOMETRIC_ROSSBY_FACTOR * zn / jnp.maximum(
+        jnp.abs(f_t), ML_GEOMETRIC_F_FLOOR)
+    k = ml.alpha * eke_int / jnp.maximum(ML_GEOMETRIC_DENOM_FLOOR, zn_slp)
+    k = jnp.minimum(ml.kappa_max, k * tmask_sfc)
+    k = (k * 0.5 * (1.0 - jnp.tanh((-ht_0 + ML_GEOMETRIC_COAST_DEPTH_M)
+                                   / ML_GEOMETRIC_COAST_WIDTH_M))
+         * 0.5 * (1.0 + jnp.tanh((zross - ml.ross_min_m)
+                                 * ML_GEOMETRIC_ROSSBY_TAPER_RATE)))
+    z1_f20 = 1.0 / (2.0 * omega * jnp.sin(
+        jnp.deg2rad(ML_GEOMETRIC_TROPICAL_LAT_DEG)))
+    k = k * jnp.minimum(1.0, jnp.abs(f_t * z1_f20))
+    return jnp.maximum(ml.kappa_min, k)
+
+
+def ml_geometric_kappa_w(kappa_sfc, sf_w, wmask):
+    """GM coefficient on W levels (:566-570): ``kappa_sfc`` at the surface
+    (weight 1, unmasked), ``kappa_sfc·SF_w·wmask`` below."""
+    return (kappa_sfc[..., None] * sf_w * wmask).at[..., 0].set(kappa_sfc)
+
+
+def ml_geometric_kappa_t(kappa_w, wmask, tmask):
+    """W-level coefficient averaged onto T levels: ``(k_w(jk) + k_w(jk+1)) /
+    max(wet W count, 1)·tmask`` — the vertical half of ldfeke's 4-point
+    u/v-face average (:574-583); the model's bolus takes the horizontal half
+    as a plain two-point face mean."""
+    zero = jnp.zeros_like(kappa_w[..., :1])
+    kb = jnp.concatenate([kappa_w[..., 1:], zero], axis=-1)
+    wb = jnp.concatenate([wmask[..., 1:], zero], axis=-1)
+    return (kappa_w * wmask + kb * wb) / jnp.maximum(wmask + wb, 1.0) * tmask
+
+
+def validate_ml_geometric_config(ml: MLGeometricConfig) -> None:
+    """Fail-fast validation of the ML-GEOMETRIC namelist values: all set,
+    finite, ``alpha > 0``, ``sf_min <= sf_max``, ``kappa_min <= kappa_max``."""
+    missing = [f for f in ml._fields if getattr(ml, f) is None]
+    if missing:
+        raise ValueError(
+            f"MLGeometricConfig has no value for {missing}: these are the "
+            "&namldf_eke namelist values (rn_geom, rn_SFmin, rn_SFmax, "
+            "rn_ross_min, rn_aeiv_min, rn_aeiv_max) and have no default.")
+    bad = [f for f in ml._fields if not jnp.isfinite(getattr(ml, f))]
+    if bad:
+        raise ValueError(f"MLGeometricConfig fields {bad} are not finite: {ml!r}")
+    if ml.alpha <= 0.0:
+        raise ValueError(f"MLGeometricConfig.alpha must be > 0, got {ml.alpha!r}")
+    if ml.sf_min > ml.sf_max:
+        raise ValueError(
+            f"MLGeometricConfig requires sf_min <= sf_max, got {ml.sf_min!r}, "
+            f"{ml.sf_max!r}")
+    if ml.kappa_min > ml.kappa_max:
+        raise ValueError(
+            "MLGeometricConfig requires kappa_min <= kappa_max, got "
+            f"{ml.kappa_min!r}, {ml.kappa_max!r}")
+
+
 def validate_geometric_config(geom: GeometricConfig) -> None:
     """Fail-fast validation of the GEOMETRIC parameters (dispatch
     discipline).  Raises ``ValueError`` on non-physical values."""
@@ -828,11 +1024,29 @@ def validate_eke_config(cfg: EKEConfig) -> None:
             "consistent with the signed -P_diss_skew source; got gm_source_mode="
             f"{cfg.gm_source_mode!r})."
         )
-    if cfg.closure not in ("eden_greatbatch", "geometric"):
+    if cfg.closure not in ("eden_greatbatch", "geometric", "ml_geometric"):
         raise ValueError(
-            "EKEConfig.closure must be 'eden_greatbatch' or 'geometric', got "
-            f"{cfg.closure!r}"
+            "unknown EKEConfig.closure scheme: expected 'eden_greatbatch', "
+            f"'geometric' or 'ml_geometric', got {cfg.closure!r}"
         )
+    if cfg.closure == "ml_geometric":
+        if cfg.ml_geometric is None:
+            raise ValueError(
+                "EKEConfig.closure='ml_geometric' requires "
+                "EKEConfig.ml_geometric (an MLGeometricConfig); got None.")
+        validate_ml_geometric_config(cfg.ml_geometric)
+        if (cfg.geometric is not None or cfg.eke_3d or cfg.isopycnal_diffusion
+                or cfg.source_kdiss_h or cfg.kdiss_h_flux_form
+                or cfg.gm_source_mode != "parameterized"
+                or cfg.source_p_diss_iso):
+            raise ValueError(
+                "EKEConfig.closure='ml_geometric' has no EKE budget and a 2-D "
+                "surface-EKE field: geometric, eke_3d, isopycnal_diffusion and "
+                "the source-augmentation flags must stay at their defaults.")
+    elif cfg.ml_geometric is not None:
+        raise ValueError(
+            f"EKEConfig.ml_geometric is set but closure={cfg.closure!r} — it "
+            "would be silently ignored.")
     if cfg.closure == "geometric":
         if cfg.geometric is None:
             raise ValueError(
@@ -888,6 +1102,15 @@ def validate_eke_config(cfg: EKEConfig) -> None:
 __all__ = [
     "EKEConfig",
     "GeometricConfig",
+    "MLGeometricConfig",
+    "ml_geometric_structure_function_w",
+    "ml_geometric_structure_function_t",
+    "ml_geometric_depth_integrated_eke",
+    "ml_geometric_column_integrals",
+    "ml_geometric_kappa_surface",
+    "ml_geometric_kappa_w",
+    "ml_geometric_kappa_t",
+    "validate_ml_geometric_config",
     "geometric_rossby_radius",
     "geometric_kappa_gm",
     "geometric_kappa_n",

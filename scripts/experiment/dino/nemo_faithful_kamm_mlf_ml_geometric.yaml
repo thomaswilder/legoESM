@@ -1,0 +1,39 @@
+# DINO at 1 degree on the NEMO-faithful card with the ML-GEOMETRIC GM closure.
+#
+# Same card as nemo_faithful_kamm_mlf.yaml (read its header) with one change:
+# gm_kappa_scheme = ml_geometric. A U-Net (vorticity-only model
+# model_20260929-121036) predicts surface EKE from surface vorticity / f once
+# a model day, outside the model step; the step projects it over depth with
+# the structure function N^2 / N^2(below the mixed layer) and turns it into a
+# depth-varying GM coefficient -- a port of the ML branch of the user's NEMO
+# ldfeke.F90 (nemo-fortran-heritage/ldfeke.F90).
+#
+# The six &namldf_eke values are the user's NEMO DINO namelist
+# (nemo-fortran-heritage/namelist_cfg, a 1/4 deg config; user: same values at
+# 1 deg). rn_SFmin = rn_SFmax = 1, so the structure function is 1 below the
+# surface. Channel rows follow the AI4PEX NEMO build (the training data's mesh).
+# NOT RUNNABLE YET: the U-Net land-fill halo width (ml_models HALO) is unset
+# pending how the halo is reproduced; the loader rejects the card.
+#
+# Reproduce once filled in:
+#   JAX_PLATFORMS=cuda JAX_ENABLE_X64=1 python scripts/run/run_dino.py \
+#       --config scripts/experiment/dino/nemo_faithful_kamm_mlf_ml_geometric.yaml
+recipe: nemo_dino_kamm_mlf
+nemo_faithful_grid: true
+nemo_resolution: R1
+nemo_channel_rows: ai4pex     # AI4PEX NEMO build, rows 13..47 at 1 deg
+grid: latlon
+dt: 2700.0                 # NEMO DINO rn_Dt; 32 steps = 1 model day (U-Net cadence)
+days: 1800
+allow_multiyear: true
+snapshot_every_days: 30
+output_dir: results/dino_nemo_faithful_kamm_mlf_ml_geometric
+gm_kappa_scheme: ml_geometric
+ml_geometric_alpha: 0.06        # rn_geom
+ml_geometric_sf_min: 1.0       # rn_SFmin
+ml_geometric_sf_max: 1.0       # rn_SFmax
+ml_geometric_ross_min_m: 7.0e3   # rn_ross_min [m]
+ml_geometric_kappa_min: 10.0    # rn_aeiv_min [m2/s]
+ml_geometric_kappa_max: 3.0e4    # rn_aeiv_max [m2/s]
+ml_geometric_weights: results/eke_unet/model_20260929-121036.npz
+ml_geometric_wall_halo: null    # ml_models HALO (land-fill halo width)
