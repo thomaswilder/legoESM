@@ -51,8 +51,9 @@ CLIP_SIGMA = 5.0
 # floor on |f| [1/s] in vorticity/f (user's choice, 2026-11-11)
 F_MIN = 1e-7
 # columns wrapped onto each side of a zonally periodic domain; >= the network's
-# receptive half-width (23 cells, measured 2026-11-11)
-WRAP_COLUMNS = 24
+# receptive half-width (23 cells, measured 2026-11-11), and 2 mod 4 so the pooling
+# grid has the same x phase as NEMO's 22-column halo (user's choice, 2026-11-12)
+WRAP_COLUMNS = 26
 
 
 class ConvBN(eqx.Module):

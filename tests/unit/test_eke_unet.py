@@ -171,7 +171,7 @@ def test_load_refuses_other_models(tmp_path):
 
 
 def test_periodic_x_makes_prediction_shift_equivariant(tmp_path):
-    # all ocean, 40 columns (+2*24 wrap = 88, a multiple of 4): rolling the input by a
+    # all ocean, 40 columns plus the x wrap: rolling the input by a
     # multiple of the pool stride rolls the output; with closed edges it does not
     net = load_eke_unet(_tiny_npz(tmp_path / "tiny.npz"))
     rng = np.random.default_rng(3)
