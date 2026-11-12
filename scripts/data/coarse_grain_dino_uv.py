@@ -22,15 +22,22 @@ face (U: east face of T(j, i), length ``e2u``; V: north face, length ``e1v``):
     a fine T row cut by the coarse face gives the same fractions to the
     U faces, so coarse cell divergences are fraction-weighted sums of fine
     ones.  Columns by the longitude overlap of fine with coarse V faces.
-* ``vel_c = Q / (L_c * wet)``, with ``wet = W / C`` the wet fraction of the
-  covered fine length (``W`` = ``Mrow @ (L_f * mask_f) @ Mcol.T``, ``C`` the same
-  without the mask).  A fully wet coarse face thus carries exactly the fine
-  transport (``vel_c * L_c = Q``); at coasts the velocity is renormalised over
-  the wet fine part (as Track B renormalises T); where the fine faces cover
-  only part of the coarse face (ring-column V faces: 1/16 of the width at
-  1 deg) the transport, not the velocity, is kept.
-* wet coarse face with no wet fine face beneath: copy the level above (plan D6).
-* dry coarse face: exactly 0.  Output float32, NEMO order ``(t, z, y, x)``.
+* ``vel_c = Q / L_c`` on every wet coarse face and level: the coarse face
+  carries exactly the fine transport through it, also where the fine faces
+  beneath are partly dry (coasts), all dry (16 U / 15 V faces at 1 deg: no
+  fine flow, so Q = 0) or cover only part of it (ring-column V faces: 1/16 of
+  the width at 1 deg).  No renormalisation over the wet part and no copy from the
+  level above: both change the transport (measured at 1 deg, 0061-01-02:
+  by up to 7 Sv and 5 Sv of a full meridional section).
+* column closure: the fine transport through the levels of a coarse face that
+  are dry on the coarse mesh (fine water below the coarse sea floor) is added
+  to the wet levels of the same face as a depth-uniform velocity.  The
+  depth-integrated transport through every coarse face with a wet level is
+  then exactly the fine one.
+* coarse face dry at every level: exactly 0.  Fine transport through such
+  faces (fine water under dry coarse columns: at 1 deg the strips along the
+  northern and southern walls and ring-column row 48) is not represented; it
+  is reported per day (``lost``).  Output float32, NEMO order ``(t, z, y, x)``.
 
 One monthly ``grid_U`` + ``grid_V`` pair in, one monthly file out.
 """
@@ -60,7 +67,6 @@ from scripts.data.coarse_grain_dino_state import (  # noqa: E402
     _VERTICAL_ATOL_M,
     cell_edges_rad,
     coarse_grid,
-    fill_from_level_above,
     read_day,
     rectilinear_axes,
 )
@@ -168,40 +174,42 @@ def static_lengths(op: FaceOperator, wet_f, wet_c):
     return wet_len, cov_len
 
 
-def coarse_velocity(vel_f, wet_f, wet_c, op: FaceOperator, wet_len, cov_len):
-    """Coarse velocity ``(z, y, x)`` float64 and the coarse face transport per unit e3.
+def coarse_velocity(vel_f, wet_f, wet_c, op: FaceOperator, e3):
+    """Coarse velocity ``(z, y, x)`` float64 and the collected fine transport per unit e3.
 
-    Returns ``(vel_c, q_c)``; ``q_c`` is the collected fine transport ``Q``
-    (before any renormalisation or fill), for the diagnostics.
+    ``e3`` is the level thickness ``(z,)`` (the same on both meshes).  Returns
+    ``(vel_c, q_c)``: ``q_c`` is ``Q`` on every coarse face, wet or dry;
+    ``vel_c = (Q + extra) / L_c`` on wet faces, with ``extra`` the fine
+    transport through the dry levels of the face spread over its wet depth.
     """
     q_c = op.apply(np.where(wet_f, vel_f * op.len_f, 0.0))
-    has = wet_c & (wet_len > 0.0)
-    out = np.zeros_like(q_c)
-    # vel = Q / (L_c * W / C)
-    out[has] = (q_c * cov_len / (op.len_c * np.where(has, wet_len, 1.0)))[has]
-    return fill_from_level_above(out, wet_c & ~has, wet_c), q_c
+    e3 = np.asarray(e3, dtype=np.float64)[:, None, None]
+    depth = np.sum(wet_c * e3, axis=0)                                # wet depth of the face, m
+    below = np.sum(np.where(wet_c, 0.0, q_c) * e3, axis=0)            # m3/s through its dry levels
+    extra = np.divide(below, depth, out=np.zeros_like(below), where=depth > 0.0)
+    return np.where(wet_c, (q_c + extra) / op.len_c, 0.0), q_c
 
 
-def transport_budget(vel_c, q_c, wet_c, wet_len, cov_len, op, e3) -> dict:
-    """Where the coarse transport differs from the collected fine one (float64).
+def transport_budget(vel_c, q_c, wet_c, op, e3) -> dict:
+    """How the coarse transport relates to the collected fine one (float64).
 
-    ``total`` = sum |Q e3| over all coarse faces; ``lost`` = on dry coarse
-    faces; ``renorm`` = |coarse - Q| on wet faces whose fine part is partly
-    dry; ``filled`` = coarse transport on faces filled from above.
+    ``total`` = sum |Q e3| over all coarse faces; ``moved`` = the part through
+    dry levels of faces with a wet level (spread over the wet levels);
+    ``lost`` = the part through faces dry at every level; ``column_max_rel`` =
+    largest mismatch of the depth-integrated transport through a face with a
+    wet level, relative to the largest such transport (round-off if correct).
     """
     e3 = np.asarray(e3, dtype=np.float64)[:, None, None]
-    t_c = vel_c * op.len_c * e3
     q = q_c * e3
-    has = wet_c & (wet_len > 0.0)
-    partial = has & (wet_len < cov_len * (1.0 - 1e-12))
+    any_wet = wet_c.any(axis=0)
+    column = np.where(any_wet, q.sum(axis=0), 0.0)
     total = float(np.sum(np.abs(q)))
     return dict(
         total=total,
-        lost=float(np.sum(np.abs(np.where(wet_c, 0.0, q)))) / total,
-        renorm=float(np.sum(np.abs(np.where(partial, t_c - q, 0.0)))) / total,
-        filled=float(np.sum(np.abs(np.where(wet_c & ~has, t_c, 0.0)))) / total,
-        full_wet_max_rel=float(np.max(np.abs(np.where(has & ~partial, t_c - q, 0.0)))
-                               / max(float(np.max(np.abs(q))), 1e-300)),
+        moved=float(np.sum(np.abs(np.where(~wet_c & any_wet, q, 0.0)))) / total,
+        lost=float(np.sum(np.abs(np.where(any_wet, 0.0, q)))) / total,
+        column_max_rel=float(np.max(np.abs((vel_c * op.len_c * e3).sum(axis=0) - column))
+                             / max(float(np.max(np.abs(column))), 1e-300)),
         n_nonfinite=int(np.count_nonzero(~np.isfinite(vel_c))),
         max_abs_dry=float(np.max(np.abs(np.where(wet_c, 0.0, vel_c)))),
     )
@@ -291,7 +299,8 @@ def create_output(path, src_u, src_v, coarse, coverage, attrs):
         v.coordinates = f"time_counter {spec['depth']} {spec['lat']} {spec['lon']}"
         v.comment = ("0 on dry coarse faces (mesh umask/vmask); no _FillValue. "
                      "Transport through a wet face = value * e2u (or e1v) * e3u_0 "
-                     "(or e3v_0) of the coarse mesh.")
+                     "(or e3v_0) of the coarse mesh; summed over depth it equals the "
+                     "1/16 deg transport through that face.")
         v = out.createVariable(spec["cov"], "f4", (spec["depth"], "y", "x"), fill_value=False)
         v[:] = coverage[name]
         v.units = "1"
@@ -335,14 +344,14 @@ def main(argv=None) -> int:
     assert_same_e3(fine, coarse)
     ops = {"uo": u_operator(fine, coarse), "vo": v_operator(fine, coarse)}
     masks = {"uo": ("umask", "e3u_0"), "vo": ("vmask", "e3v_0")}
-    lens, coverage, n_fill = {}, {}, {}
+    coverage, n_fill = {}, {}
     for name, op in ops.items():
         wet_f, wet_c = fine[masks[name][0]], coarse[masks[name][0]]
-        lens[name] = static_lengths(op, wet_f, wet_c)
-        coverage[name] = lens[name][0] / op.len_c
-        n_fill[name] = int(np.count_nonzero(wet_c & (lens[name][0] <= 0.0)))
+        wet_len, _ = static_lengths(op, wet_f, wet_c)
+        coverage[name] = wet_len / op.len_c
+        n_fill[name] = int(np.count_nonzero(wet_c & (wet_len <= 0.0)))
     print(f"setup {time.perf_counter() - t0:.1f} s: wet coarse faces with no wet fine "
-          f"face (filled from above): u {n_fill['uo']}, v {n_fill['vo']}", flush=True)
+          f"face (no fine flow through them): u {n_fill['uo']}, v {n_fill['vo']}", flush=True)
 
     tag, label = coarse_grid(coarse["glamf"])
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -357,9 +366,9 @@ def main(argv=None) -> int:
                 "coincident columns (U; last coarse column = periodic seam = last "
                 "fine column), linear latitude interpolation between bracketing fine "
                 "V rows (V rows) and longitude overlap (V columns); velocity = "
-                "transport / (coarse face length * wet fraction of the covered fine "
-                "length); wet coarse faces with no wet fine face copy the level "
-                "above; dry faces 0"),
+                "transport / coarse face length on wet coarse faces; fine transport "
+                "through the dry levels of a coarse face with a wet level is added to "
+                "its wet levels as a depth-uniform velocity; faces dry at every level 0"),
         source_file_u=str(args.grid_u.resolve()),
         source_file_v=str(args.grid_v.resolve()),
         fine_mesh=str(args.fine_mesh.resolve()),
@@ -367,7 +376,8 @@ def main(argv=None) -> int:
         command=" ".join([Path(sys.argv[0]).name] + (argv if argv is not None else sys.argv[1:])),
         legoesm_git_commit=prov.commit, legoesm_git_dirty=int(prov.dirty),
         legoesm_package_git_commit=kprov.commit,
-        n_filled_from_above_u=n_fill["uo"], n_filled_from_above_v=n_fill["vo"],
+        n_wet_faces_without_fine_water_u=n_fill["uo"],
+        n_wet_faces_without_fine_water_v=n_fill["vo"],
     )
 
     with netCDF4.Dataset(args.grid_u) as su, netCDF4.Dataset(args.grid_v) as sv:
@@ -389,14 +399,14 @@ def main(argv=None) -> int:
                     mask, e3 = masks[name]
                     wet_f, wet_c = fine[mask], coarse[mask]
                     f = read_day(src, name, t, wet_f)
-                    c, q = coarse_velocity(f, wet_f, wet_c, ops[name], *lens[name])
-                    b = transport_budget(c, q, wet_c, *lens[name], ops[name], coarse[e3])
-                    if b["n_nonfinite"] or b["max_abs_dry"] != 0.0:
+                    c, q = coarse_velocity(f, wet_f, wet_c, ops[name], coarse[e3])
+                    b = transport_budget(c, q, wet_c, ops[name], coarse[e3])
+                    if b["n_nonfinite"] or b["max_abs_dry"] != 0.0 or b["column_max_rel"] > 1e-9:
                         raise RuntimeError(f"{name} day {t}: {b}")
                     out[name][t] = c.astype(np.float32)
                     print(f"day {t} {name}: |transport| {b['total']:.6g} m3/s; fractions: "
-                          f"lost {b['lost']:.3e} renorm {b['renorm']:.3e} filled "
-                          f"{b['filled']:.3e}; full-wet max rel {b['full_wet_max_rel']:.2e}; "
+                          f"moved {b['moved']:.3e} lost {b['lost']:.3e}; "
+                          f"face-column max rel {b['column_max_rel']:.2e}; "
                           f"min/max/mean {c.min():.4f} {c.max():.4f} "
                           f"{c[wet_c].mean():.3e} m/s", flush=True)
                 print(f"day {t}: {time.perf_counter() - td:.1f} s", flush=True)

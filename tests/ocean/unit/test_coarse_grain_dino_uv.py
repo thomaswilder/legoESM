@@ -69,10 +69,10 @@ def test_u_transport_conserved_where_faces_nest(pair):
     f, c, op, _ = pair
     rng = np.random.default_rng(0)
     u_f = rng.normal(0.0, 0.3, f["umask"].shape)
-    wet_len, cov_len = cg.static_lengths(op, f["umask"], c["umask"])
-    vel, _ = cg.coarse_velocity(u_f, f["umask"], c["umask"], op, wet_len, cov_len)
+    vel, q = cg.coarse_velocity(u_f, f["umask"], c["umask"], op, c["e3u_0"])
     ref = _fine_sum_through_coarse_u_faces(u_f, f["umask"], f["e2u"], f, c)
-    full = (c["umask"] & np.isclose(wet_len, cov_len, rtol=1e-12, atol=0.0))[:, :, :-1]
+    # level by level, on the wet faces of columns with no fine flow below the coarse floor
+    full = (c["umask"] & np.all(c["umask"] | (q == 0.0), axis=0))[:, :, :-1]
     assert full.sum() > 1000
     got = (vel * c["e2u"])[:, :, :-1]
     scale = np.max(np.abs(ref[full]))
@@ -80,9 +80,39 @@ def test_u_transport_conserved_where_faces_nest(pair):
     # non-vacuous: without the e2u weighting of the fine faces it fails
     flat = cg.FaceOperator(op.mrow.toarray(), op.mcol_t.T.toarray(),
                            np.broadcast_to(f["e2u"].mean(axis=0), f["e2u"].shape), op.len_c)
-    vel0, _ = cg.coarse_velocity(u_f, f["umask"], c["umask"], flat,
-                                 *cg.static_lengths(flat, f["umask"], c["umask"]))
+    vel0, _ = cg.coarse_velocity(u_f, f["umask"], c["umask"], flat, c["e3u_0"])
     assert np.max(np.abs((vel0 * c["e2u"])[:, :, :-1] - ref)[full]) > 1e-6 * scale
+
+
+def test_face_column_carries_the_fine_depth_integrated_transport(pair):
+    """Every coarse face with a wet level carries the fine transport of its whole column.
+
+    Fails for a rule that drops the fine flow below the coarse sea floor,
+    renormalises the velocity over the wet part of a face, or copies a
+    velocity onto a face with no fine water beneath.
+    """
+    f, c, op_u, op_v = pair
+    rng = np.random.default_rng(2)
+    e3 = c["e3u_0"][:, None, None]
+    u_f = rng.normal(0.0, 0.3, f["umask"].shape)
+    v_f = rng.normal(0.0, 0.3, f["vmask"].shape)
+    vel_u, q_u = cg.coarse_velocity(u_f, f["umask"], c["umask"], op_u, c["e3u_0"])
+    vel_v, q_v = cg.coarse_velocity(v_f, f["vmask"], c["vmask"], op_v, c["e3v_0"])
+    # U: fine transport summed independently of the operator (not the seam column)
+    ref_u = (_fine_sum_through_coarse_u_faces(u_f, f["umask"], f["e2u"], f, c) * e3).sum(axis=0)
+    for vel, ref, wet in (
+            ((vel_u * c["e2u"])[:, :, :-1], ref_u, c["umask"][:, :, :-1]),
+            (vel_v * c["e1v"], (q_v * e3).sum(axis=0), c["vmask"])):
+        some = wet.any(axis=0)
+        got = (vel * e3).sum(axis=0)
+        assert np.max(np.abs(got - ref)[some]) < 1e-12 * np.max(np.abs(ref[some]))
+        assert np.all(vel[~wet] == 0.0)
+    # non-vacuous: the pair has fine flow below the coarse floor and partly wet faces
+    for q, wet, op, fmask in ((q_u, c["umask"], op_u, f["umask"]),
+                              (q_v, c["vmask"], op_v, f["vmask"])):
+        wet_len, cov_len = cg.static_lengths(op, fmask, wet)
+        assert np.count_nonzero(~wet & wet.any(axis=0) & (q != 0.0)) > 100
+        assert np.count_nonzero(wet & (wet_len > 0.0) & (wet_len < cov_len * (1 - 1e-12))) > 100
 
 
 def _div(tu, tv):
@@ -100,10 +130,8 @@ def test_coarse_divergence_is_fraction_weighted_fine_divergence(pair):
         w["vmask"][:, -1] = False                  # closed northern boundary
     rng = np.random.default_rng(1)
     u_f, v_f = rng.normal(size=wet["umask"].shape), rng.normal(size=wet["vmask"].shape)
-    tu = cg.coarse_velocity(u_f, wet["umask"], wet_c["umask"], op_u,
-                            *cg.static_lengths(op_u, wet["umask"], wet_c["umask"]))[0] * c["e2u"]
-    tv = cg.coarse_velocity(v_f, wet["vmask"], wet_c["vmask"], op_v,
-                            *cg.static_lengths(op_v, wet["vmask"], wet_c["vmask"]))[0] * c["e1v"]
+    tu = cg.coarse_velocity(u_f, wet["umask"], wet_c["umask"], op_u, np.ones(nz))[0] * c["e2u"]
+    tv = cg.coarse_velocity(v_f, wet["vmask"], wet_c["vmask"], op_v, np.ones(nz))[0] * c["e1v"]
     div_c = _div(tu, tv)
     div_f = _div(np.where(wet["umask"], u_f * f["e2u"], 0.0),
                  np.where(wet["vmask"], v_f * f["e1v"], 0.0))
@@ -163,7 +191,7 @@ def _write_src(path, m, var, depth, mask, val):
 
 
 def test_main_writes_month_file(pair, tmp_path):
-    f, c, _, _ = pair
+    f, c, _, op_v = pair
     _write_mesh(tmp_path / "fine_mesh.nc", f)
     _write_mesh(tmp_path / "coarse_mesh.nc", c)
     su = tmp_path / "MINT_1d_00610101_00610102_grid_U.nc"
@@ -181,10 +209,19 @@ def test_main_writes_month_file(pair, tmp_path):
         assert o["uo"].dtype == np.float32 and u.shape == c["umask"].shape
         assert np.all(u[~c["umask"]] == 0.0) and np.all(v[~c["vmask"]] == 0.0)
         cov_v = np.asarray(o["coverage_v"])
-        full = c["vmask"] & np.isclose(cov_v, 1.0, atol=1e-6)
-        assert np.max(np.abs(v[full] - 0.1)) < 1e-6
-        ring = c["vmask"][:, :, 0]                 # 1/4 covered: transport kept
-        assert np.max(np.abs(v[:, :, 0][ring] - 0.1 * cov_v[:, :, 0][ring])) < 1e-6
+        # columns with no fine water below the coarse floor: velocity = 0.1 * coverage
+        # (1 on fully wet faces; 1/4 on the ring columns, where the transport is kept)
+        wet_len = cg.static_lengths(op_v, f["vmask"], c["vmask"])[0]
+        plain = c["vmask"] & ~np.any(~c["vmask"] & (wet_len > 0.0), axis=0)
+        assert (plain & np.isclose(cov_v, 1.0, atol=1e-6)).sum() > 1000
+        assert plain[:, :, 0].any()
+        assert np.max(np.abs(v - 0.1 * cov_v)[plain]) < 1e-6
+        # every face column: the fine depth-integrated transport (0.1 m/s on all wet fine faces)
+        e3 = c["e3v_0"][:, None, None]
+        fine = 0.1 * (wet_len * e3).sum(axis=0)
+        some = c["vmask"].any(axis=0)
+        got = (v.astype(np.float64) * c["e1v"] * e3).sum(axis=0)
+        assert np.max(np.abs(got - fine)[some]) < 1e-5 * np.max(fine[some])
         assert o["uo"].standard_name == "sea_water_x_velocity"
         assert o["vo"].units == "m/s"
         assert o.legoesm_git_commit
