@@ -265,10 +265,11 @@ def main():
     check("4 shape and offsets", tuple(x0.shape) == tuple(data["expect"]["input_shape"])
           and (h, w) == (cfg["halo"], data["expect"]["wrap_columns"]) and WRAP_COLUMNS == w,
           f"network_input -> {tuple(x0.shape)}, {x0.dtype}, halo rows {h}, wrapped columns {w}; field at rows {h}:{h + ny}, columns {w}:{w + nx}")
-    ni = jax.jit(lambda v: network_input(net, v, mask_j, fill, cfg["periodic_x"])[0])
+    # eager, as ml_geometric_refresh_eke calls it online (a jitted version did not reproduce a fresh
+    # eager call bit for bit on day 0, the first run of check 4)
     X = np.empty((data["n_days"], *x0.shape[:2]), np.float32)
     for d in range(data["n_days"]):
-        X[d] = np.asarray(ni(jnp.asarray(vof32[d])))[..., 0]
+        X[d] = np.asarray(network_input(net, jnp.asarray(vof32[d]), mask_j, fill, cfg["periodic_x"])[0])[..., 0]
     check("4 X finite", bool(np.isfinite(X).all()), f"X {X.shape} {X.dtype}, min {X.min():.3f}, max {X.max():.3f}")
 
     # check 4: the network_input path is what predict_eke runs, and the stored X is that input
