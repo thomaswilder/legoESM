@@ -28,8 +28,14 @@ statistics are frozen (no gradient reaches them), so fine-tuning trains the
 convolutions and BatchNorm's scale and shift only. They are still pytree
 leaves: an optimizer with weight decay must mask them out.
 
+The vorticity/f normalisation (mean, std) belongs to the weights: each ``.npz``
+carries its own ``vor_norm`` (the base model's is (-0.0025, 0.1423), computed
+on 1/4 deg data; a model fine-tuned at 1 deg carries 1 deg statistics) and
+:func:`load_eke_unet` puts it on the network as ``vor_mean`` / ``vor_std``.
+
 Online, :func:`surface_vorticity_over_f` builds the input from the model's
-velocities, and :func:`predict_eke` runs the network on it.
+velocities, :func:`network_input` turns it into the network's input array, and
+:func:`predict_eke` runs the network on it.
 
 Weights come from a plain ``.npz`` written by
 ``scripts/data/convert_eke_unet_keras_to_npz.py`` (TensorFlow is not needed
@@ -44,8 +50,6 @@ import jax.numpy as jnp
 import numpy as np
 from scipy.ndimage import distance_transform_edt
 
-# vorticity/f normalisation (mean, std): the norm_stats in the model's provenance
-VOR_MEAN, VOR_STD = -0.0025, 0.1423
 # normalised inputs are clipped to +/- this many standard deviations (ml_models.CLIP_SIGMA)
 CLIP_SIGMA = 5.0
 # floor on |f| [1/s] in vorticity/f (user's choice, 2026-11-11)
@@ -82,12 +86,16 @@ class ConvBN(eqx.Module):
 class EKEUNet(eqx.Module):
     """The EKE U-Net on one sample: (H, W, 1) normalised vorticity/f -> (H, W, 1) log EKE.
 
-    H and W must be multiples of ``2**len(enc)``; :func:`predict_eke` pads to that.
+    H and W must be multiples of ``2**len(enc)``; :func:`network_input` pads to that.
+    ``vor_mean``, ``vor_std``: the vorticity/f normalisation the weights were
+    trained with (static, so not trained); :func:`preprocess` applies it.
     """
     enc: list   # per level, (ConvBN, ConvBN)
     bottleneck: tuple
     dec: list   # coarse to fine, (ConvBN, ConvBN)
     out_kernel: jax.Array  # (1, 1, C, 1)
+    vor_mean: float = eqx.field(static=True)
+    vor_std: float = eqx.field(static=True)
 
     def __call__(self, x):
         skips = []
@@ -107,18 +115,23 @@ class EKEUNet(eqx.Module):
 def load_eke_unet(path) -> EKEUNet:
     """Build an :class:`EKEUNet` from the ``.npz`` written by the conversion script.
 
-    Refuses a file whose model is not the one this module describes (inputs,
-    target or vorticity normalisation differ, or the file predates those records).
+    Refuses a file whose model is not the one this module describes (inputs or
+    target differ, the vorticity normalisation is not a finite mean with a
+    finite positive std, or the file predates those records).
     """
     w = np.load(path)
     for key in ("features", "target", "vor_norm"):
         if key not in w.files:
             raise ValueError(f"{path}: no '{key}' record; reconvert with "
                              "scripts/data/convert_eke_unet_keras_to_npz.py")
-    got = (list(w["features"]), list(w["target"]), tuple(float(a) for a in w["vor_norm"]))
-    if got != (["vor"], ["fine_ke"], (VOR_MEAN, VOR_STD)):
-        raise ValueError(f"{path}: model has (features, target, vor mean/std) {got}; "
-                         f"this port takes (['vor'], ['fine_ke'], {(VOR_MEAN, VOR_STD)})")
+    got = (list(w["features"]), list(w["target"]))
+    if got != (["vor"], ["fine_ke"]):
+        raise ValueError(f"{path}: model has (features, target) {got}; "
+                         "this port takes (['vor'], ['fine_ke'])")
+    vor_mean, vor_std = (float(a) for a in w["vor_norm"])
+    if not (np.isfinite(vor_mean) and np.isfinite(vor_std) and vor_std > 0):
+        raise ValueError(f"{path}: vor_norm (mean, std) = {(vor_mean, vor_std)} must be "
+                         "a finite mean and a finite positive std")
     eps = float(w["bn_epsilon"])
 
     def block(prefix):
@@ -134,17 +147,19 @@ def load_eke_unet(path) -> EKEUNet:
         bottleneck=block("bottleneck"),
         dec=[block(f"dec{i}") for i in range(depth)],
         out_kernel=jnp.asarray(w["out_kernel"]),
+        vor_mean=vor_mean,
+        vor_std=vor_std,
     )
 
 
-def preprocess(vor, mask):
+def preprocess(vor, mask, vor_mean, vor_std):
     """Normalised, clipped vorticity/f as (ny, nx, 1), zero on land.
 
     Port of ``ml_models.preprocess_inputs`` followed by the clip in
     ``ml_geometric``, on 2D (y, x) fields already in the network's
     orientation (NEMO's (i, j, 1) squeeze and transpose are left to the caller).
     """
-    a = jnp.clip((vor - VOR_MEAN) / VOR_STD * mask, -CLIP_SIGMA, CLIP_SIGMA)
+    a = jnp.clip((vor - vor_mean) / vor_std * mask, -CLIP_SIGMA, CLIP_SIGMA)
     return a[..., None]
 
 
@@ -197,29 +212,28 @@ def surface_vorticity_over_f(u, v, grid):
     return zeta / jnp.where(f < 0, jnp.minimum(f, -F_MIN), jnp.maximum(f, F_MIN))
 
 
-def predict_eke(net: EKEUNet, vor, mask, fill_index, periodic_x: bool = False):
-    """Surface EKE on (ny, nx) from surface relative vorticity / f.
+def network_input(net: EKEUNet, vor, mask, fill_index, periodic_x: bool = False):
+    """The network's input array from surface relative vorticity / f on (ny, nx).
 
-    Port of ``ml_models.ml_geometric`` minus its NEMO reshaping and its
-    non-finite check (which raises, so cannot run under jit): preprocess and
-    clip, wall fill (``fill_index`` from :func:`wall_fill_index`; built with
-    ``pad_ns=True``, the N/S halo rows are added here first and cropped after
-    the network), edge-pad to a multiple of ``2**depth``, network, crop, exp,
-    zero on land.
+    Port of ``ml_models.ml_geometric`` before its network call: preprocess and
+    clip with ``net``'s normalisation, wall fill (``fill_index`` from
+    :func:`wall_fill_index`; built with ``pad_ns=True``, the N/S halo rows are
+    added here first), ``WRAP_COLUMNS`` wrapped columns on each side when
+    ``periodic_x`` (legoESM DINO's channel; else the x edges are closed), and
+    an edge-pad to a multiple of ``2**depth``. Runs in the network's dtype
+    (float32).
 
-    ``periodic_x``: the domain wraps in x (legoESM DINO's channel), so
-    ``WRAP_COLUMNS`` columns from the opposite side are added on each side
-    before the network instead of treating the x edges as closed. Inputs run
-    in the network's dtype (float32); the result is cast back to ``vor``'s.
+    Returns ``(x, h, w)``: ``x`` of shape (ny + 2 h + pad, nx + 2 w + pad, 1),
+    ``h`` the halo rows and ``w`` the wrapped columns added on each side, so
+    the field is ``x[h:h + ny, w:w + nx]`` after the network.
     """
     ny, nx = mask.shape
     # halo rows added at each N/S edge by wall_fill_index(pad_ns=True), else 0
     h, odd = divmod(fill_index[0].shape[0] - ny, 2)
     if odd or h < 0 or fill_index[0].shape[1] != nx:
         raise ValueError(f"fill_index shape {fill_index[0].shape} does not fit mask {mask.shape}")
-    out_dtype = vor.dtype
     dt = net.out_kernel.dtype
-    x = preprocess(vor.astype(dt), mask.astype(dt))
+    x = preprocess(vor.astype(dt), mask.astype(dt), net.vor_mean, net.vor_std)
     x = jnp.pad(x, ((h, h), (0, 0), (0, 0)))[fill_index]
     w = WRAP_COLUMNS if periodic_x else 0
     # shortcut: the land fill's nearest ocean cell does not look across the seam;
@@ -227,7 +241,20 @@ def predict_eke(net: EKEUNet, vor, mask, fill_index, periodic_x: bool = False):
     x = jnp.pad(x, ((0, 0), (w, w), (0, 0)), mode="wrap")
     m = 2 ** len(net.enc)
     x = jnp.pad(x, ((0, -(ny + 2 * h) % m), (0, -(nx + 2 * w) % m), (0, 0)), mode="edge")
+    return x, h, w
+
+
+def predict_eke(net: EKEUNet, vor, mask, fill_index, periodic_x: bool = False):
+    """Surface EKE on (ny, nx) from surface relative vorticity / f.
+
+    Port of ``ml_models.ml_geometric`` minus its NEMO reshaping and its
+    non-finite check (which raises, so cannot run under jit):
+    :func:`network_input`, network, crop the halo, exp, zero on land. The
+    result is cast back to ``vor``'s dtype.
+    """
+    ny, nx = mask.shape
+    x, h, w = network_input(net, vor, mask, fill_index, periodic_x)
     log_eke = net(x)[h:h + ny, w:w + nx, 0]
     ocean = mask > 0
     # exp only of ocean values: an overflow on land would make the gradient NaN
-    return jnp.where(ocean, jnp.exp(jnp.where(ocean, log_eke, 0.0)), 0.0).astype(out_dtype)
+    return jnp.where(ocean, jnp.exp(jnp.where(ocean, log_eke, 0.0)), 0.0).astype(vor.dtype)

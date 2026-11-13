@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 from legoesm.ml.eke_unet import (
     load_eke_unet,
+    network_input,
     predict_eke,
     preprocess,
     surface_vorticity_over_f,
@@ -30,13 +31,15 @@ WEIGHTS = os.environ.get("LEGOESM_EKE_UNET_NPZ") or str(
     pathlib.Path(__file__).resolve().parents[2]
     / "results" / "eke_unet" / "model_20260929-121036.npz")
 TINY_TF = pathlib.Path(__file__).parent / "fixtures" / "eke_unet_tiny_tf_reference.npz"
+# the base model's vorticity/f normalisation, as written into the tiny weights below
+VOR_MEAN, VOR_STD = -0.0025, 0.1423
 
 
 def _tiny_npz(path, base=4, depth=2, seed=0):
     """Random weights in the converter's key schema."""
     rng = np.random.default_rng(seed)
     out = {"bn_epsilon": np.float32(1e-3), "features": np.array(["vor"]),
-           "target": np.array(["fine_ke"]), "vor_norm": np.array([-0.0025, 0.1423])}
+           "target": np.array(["fine_ke"]), "vor_norm": np.array([VOR_MEAN, VOR_STD])}
 
     def block(prefix, cin, cout):
         for j, ci in enumerate((cin, cout)):
@@ -70,17 +73,17 @@ def _fields(ny, nx):
 
 def test_preprocess_normalises_and_zeroes_land():
     vor, mask = _fields(20, 9)
-    feats = np.asarray(preprocess(vor, mask))
+    feats = np.asarray(preprocess(vor, mask, VOR_MEAN, VOR_STD))
     ocean = mask > 0
     assert feats.shape == (20, 9, 1)
-    np.testing.assert_allclose(feats[..., 0][ocean], ((vor + 0.0025) / 0.1423)[ocean], rtol=1e-12)
+    np.testing.assert_allclose(feats[..., 0][ocean], ((vor - VOR_MEAN) / VOR_STD)[ocean], rtol=1e-12)
     assert np.all(feats[..., 0][~ocean] == 0.0)
 
 
 def test_preprocess_clips_out_of_range_inputs():
     _, mask = _fields(8, 8)
     vor = np.where(np.arange(8)[None, :] < 4, 8.0, -8.0) * np.ones_like(mask)
-    feats = np.asarray(preprocess(vor, mask))
+    feats = np.asarray(preprocess(vor, mask, VOR_MEAN, VOR_STD))
     assert feats.max() == 5.0 and feats.min() == -5.0
 
 
@@ -119,7 +122,7 @@ def test_closed_ns_halo_added_and_cropped_as_nemo(tmp_path):
     net = jax.tree.map(lambda w: w.astype(jnp.float64),
                        load_eke_unet(_tiny_npz(tmp_path / "tiny.npz")))
     vor = jnp.asarray(0.1 * np.random.default_rng(2).standard_normal((5, 4)))
-    x = np.asarray(preprocess(vor, jnp.asarray(mask)))
+    x = np.asarray(preprocess(vor, jnp.asarray(mask), net.vor_mean, net.vor_std))
     src = (expected - 1).astype(int)                      # source cell of each filled value
     filled = x[src // 10, src % 10]                       # (9, 4, 1)
     log_eke = net(jnp.pad(filled, ((0, 3), (0, 0), (0, 0)), mode="edge"))[2:7, :, 0]
@@ -160,14 +163,55 @@ def test_tiny_network_shapes_jit_and_gradients(tmp_path):
 def test_load_refuses_other_models(tmp_path):
     path = _tiny_npz(tmp_path / "ok.npz")
     w = dict(np.load(path))
-    for key, bad in (("features", np.array(["coarse_ke_log", "vor", "sa"])),
-                     ("vor_norm", np.array([0.0, 1.0]))):
-        np.savez(tmp_path / "bad.npz", **{**w, key: bad})
-        with pytest.raises(ValueError, match="this port takes"):
-            load_eke_unet(tmp_path / "bad.npz")
+    np.savez(tmp_path / "bad.npz", **{**w, "features": np.array(["coarse_ke_log", "vor", "sa"])})
+    with pytest.raises(ValueError, match="this port takes"):
+        load_eke_unet(tmp_path / "bad.npz")
     np.savez(tmp_path / "old.npz", **{k: v for k, v in w.items() if k != "target"})
     with pytest.raises(ValueError, match="no 'target' record"):
         load_eke_unet(tmp_path / "old.npz")
+
+
+def test_vor_norm_comes_from_the_file(tmp_path):
+    # the weights carry their own vorticity/f statistics (a 1 deg fine-tune has other ones)
+    w = dict(np.load(_tiny_npz(tmp_path / "ok.npz")))
+    np.savez(tmp_path / "ft.npz", **{**w, "vor_norm": np.array([-0.0008, 0.0164])})
+    base, ft = load_eke_unet(tmp_path / "ok.npz"), load_eke_unet(tmp_path / "ft.npz")
+    assert (base.vor_mean, base.vor_std) == (VOR_MEAN, VOR_STD)
+    assert (ft.vor_mean, ft.vor_std) == (-0.0008, 0.0164)
+    vor, mask = _fields(13, 10)
+    idx = wall_fill_index(mask, 0, pad_ns=False)
+    args = (jnp.asarray(vor, jnp.float32), jnp.asarray(mask, jnp.float32), idx)
+    assert not np.allclose(network_input(base, *args)[0], network_input(ft, *args)[0])
+    ocean = mask > 0
+    np.testing.assert_allclose(np.asarray(preprocess(vor, mask, ft.vor_mean, ft.vor_std))[..., 0][ocean],
+                               np.clip((vor + 0.0008) / 0.0164, -5.0, 5.0)[ocean], rtol=1e-12)
+
+
+@pytest.mark.parametrize("bad", ([0.0, 0.0], [0.0, -1.0], [0.0, np.nan], [0.0, np.inf], [np.nan, 1.0]))
+def test_load_refuses_unusable_vor_norm(tmp_path, bad):
+    w = dict(np.load(_tiny_npz(tmp_path / "ok.npz")))
+    np.savez(tmp_path / "bad.npz", **{**w, "vor_norm": np.array(bad)})
+    with pytest.raises(ValueError, match="finite positive std"):
+        load_eke_unet(tmp_path / "bad.npz")
+
+
+def test_network_input_is_what_predict_eke_runs_the_network_on(tmp_path):
+    """check 4 of the 1 deg fine-tune spec on the tiny network: net(network_input),
+    cropped, exp, times mask equals predict_eke exactly, with the closed N/S halo
+    and the x wrap; offsets and the multiple-of-4 padding as for the real domain."""
+    net = load_eke_unet(_tiny_npz(tmp_path / "tiny.npz"))
+    ny, nx, halo = 19, 12, 6
+    vor, mask = (jnp.asarray(a, jnp.float32) for a in _fields(ny, nx))
+    idx = wall_fill_index(np.asarray(mask), halo, pad_ns=True)
+    x, h, w = network_input(net, vor, mask, idx, periodic_x=True)
+    # 19 + 2 * 6 = 31 rows -> 32; 12 + 2 * 26 = 64 columns (depth 2: multiples of 4)
+    assert (h, w) == (halo, 26) and x.shape == (32, 64, 1) and x.dtype == jnp.float32
+    via = jnp.where(mask > 0, jnp.exp(net(x)[h:h + ny, w:w + nx, 0]), 0.0)
+    np.testing.assert_array_equal(via, predict_eke(net, vor, mask, idx, periodic_x=True))
+    # closed x edges add no columns
+    assert network_input(net, vor, mask, idx)[1:] == (halo, 0)
+    with pytest.raises(ValueError, match="does not fit"):
+        network_input(net, vor, mask, tuple(a[:, :5] for a in idx))
 
 
 def test_periodic_x_makes_prediction_shift_equivariant(tmp_path):
