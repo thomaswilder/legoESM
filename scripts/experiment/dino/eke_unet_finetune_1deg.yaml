@@ -108,7 +108,7 @@ acceptance:
   A3: {ratio_min: 0.5, ratio_max: 2.0, bands: [all, abs_lat_ge_20, abs_lat_lt_20]}
   A4: {low10_max: 0.05}
   A5: {r2_margin_over_Db_min_exclusive: 0.10}
-  A6: {max_abs_log_eke_diff: 5.0e-5}
+  A6: {max_abs_log_eke_diff: 1.0e-4}   # user decision 2026-11-13 (was 5e-5), spec Answers block
 
 checks:                     # section 7
   stats_std_rel_tol: 0.02
@@ -132,7 +132,7 @@ checks:                     # section 7
     all: {r2: 0.254, bias: 0.430}
     abs_lat_ge_20: {r2: 0.578, bias: 0.260}
   D_c_r2_range: [0.83, 0.86]  # check 7, test days
-  keras_vs_jax_max_abs_log_eke: 5.0e-5   # check 8, wet cells
+  keras_vs_jax_max_abs_log_eke: 1.0e-4   # check 8, wet cells; user decision 2026-11-13 (was 5e-5), spec Answers block
   val_loss_rel_tol: 1.0e-3  # check 11: JAX masked MSE on validation days vs best Keras val_loss
 
 # ---- section 8: outputs ----
