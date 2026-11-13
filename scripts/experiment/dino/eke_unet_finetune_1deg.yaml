@@ -1,0 +1,145 @@
+# Fine-tuning the DINO EKE U-Net (model_20260929-121036) to 1 deg.
+# Every value of sections 4-6 of markdown-notes/unet_1deg_finetune_spec.md
+# (the spec, 2026-11-13, with the orchestrator's answers U1 approved, U2 = 100 km
+# EKE, U3 = the GPU job). The scripts hold no literal of these.
+#
+#   scripts/data/prepare_eke_unet_finetune_data.py   legoESM venv, checks 1-4, 9
+#   scripts/data/convert_eke_unet_keras_to_npz.py    (the converter, unchanged)
+#   scripts/data/finetune_eke_unet_keras.py          TF env, section 5
+#   scripts/validate/eke_unet_1deg_skill.py          legoESM venv, section 6
+#
+# `$ai4pex` is unset in the shell; the path is spelled out here and nowhere else.
+
+# ---- section 4: data at 1 deg (read only) ----
+data:
+  dir: /gws/ssde/j25b/ai4pex/twilder/NEMO_data/DINO/EXP16/features_1deg/FULL
+  vor_file: MINT_1d_0061-0072_vor_cg_FULL_mod.nc
+  eke_file: MINT_1d_0061-0072_eke_Lmin3LdO25_cg_FULL.nc   # the name is wrong for its content: the fixed 100 km filter (U2)
+  mesh_file: mesh_mask_1deg_FULL_xnemo.nc
+  coverage_file: coverage_cg_FULL.nc
+  vor_var: vor              # (y_c, x_c, t) on disk: raw vorticity [1/s], time last
+  eke_var: fine_ke          # (t, y_c, x_c) [m2/s2]
+  coverage_var: wet_coverage
+  n_days: 4320              # time axes 0..4319, step 1 day, 360-day calendar
+  expect:                   # read-back (check 1)
+    ny: 199
+    nx: 52
+    wet_cells: 9920
+    scored_cells: 9850
+    low_coverage_wet_cells: 70
+    zero_f_rows: [99]
+    land_rows: [0, 198]
+    ring_wet_rows: [13, 47]   # first and last wet row of every dropped column
+    input_shape: [244, 104, 1]   # network_input on the 199 x 52 field; the field sits at rows 22:221, columns 26:78
+    wrap_columns: 26
+grid:                       # check 2: the legoESM 1 deg DINO grid the network runs on online
+  nemo_resolution: R1
+  nemo_channel_rows: ai4pex
+
+# input, as online: vor / fs, then network_input; fs floors |f| at F_MIN (imported from legoesm.ml.eke_unet)
+halo: 22                    # N/S land rows added; ml_models.HALO
+periodic_x: true            # legoESM DINO's channel wraps in x
+pad_ns: true                # fields carry no halo of their own
+
+# U1: input statistics of the fine-tuned file. Definition: area-weighted (e1t e2t) mean and std of
+# vor/f over train days and scored cells with |lat| >= stats_min_abs_lat_deg, float64, two-pass
+# (planning value on days 0..3239: -0.000766, 0.016386).
+vor_norm:
+  mean: -0.0008
+  std: 0.0164
+stats_min_abs_lat_deg: 20.0
+
+# scored cells S: surface tmask == 1 and wet_coverage >= coverage_min and column not in dropped_columns
+coverage_min: 0.5
+dropped_columns: [0, 51]    # ring columns: values are means over 1/16 of a cell
+
+# split by day index, inclusive; 90-day gaps (autocorrelation of log EKE anomalies 0.14 at 90 days)
+splits:
+  train: [0, 3149]
+  validation: [3240, 3509]
+  test: [3600, 4319]
+  min_separation_days: 91
+
+# ---- section 2/5: base model and recipe ----
+base:
+  keras: /home/users/twilder/Python/AI4PEX/machine_learning/models/unet/MSE-eke_Lmin3LdO25/hold_out_features/model_20260929-121036.keras
+  npz: /home/users/twilder/legoESM/results/eke_unet/model_20260929-121036.npz
+  code_dir: /home/users/twilder/Python/AI4PEX/machine_learning
+  expect:
+    n_trainable_arrays: 31
+    n_trainable_values: 1883264
+    n_non_trainable_values: 2564
+    n_bn_moving_arrays: 20
+training:
+  seed: 0                   # keras.utils.set_random_seed before the model is loaded
+  batch_size: 16            # days; 197 steps per epoch
+  learning_rate: 1.0e-4     # Adam, constant, Keras defaults otherwise, no EMA
+  max_epochs: 80
+  early_stopping_patience: 10
+  early_stopping_min_delta: 0.0
+  halt_if_val_above_start_at_epoch: 5   # section 10: val loss at this epoch above D-b's before training stops the run
+  require_gpu: true
+
+# ---- section 6: scores and acceptance ----
+scoring:
+  low10_factor: 10.0        # low10 = fraction of (day, cell) with p < y - ln(factor)
+  bands:                    # |lat| in [min, max) of the T point
+    - {name: all, min: 0.0, max: 91.0}
+    - {name: abs_lat_ge_20, min: 20.0, max: 91.0}
+    - {name: abs_lat_lt_20, min: 0.0, max: 20.0}
+    - {name: abs_lat_0_5, min: 0.0, max: 5.0}
+    - {name: abs_lat_5_10, min: 5.0, max: 10.0}
+    - {name: abs_lat_10_20, min: 10.0, max: 20.0}
+  boxes:                    # lon, lat of T points, inclusive, scored cells
+    SO_JET: {lon: [3.375, 13.125], lat: [-46.22, -39.07]}
+    SO_EAST: {lon: [35.125, 44.875], lat: [-48.26, -41.36]}
+    SO_GYRE: {lon: [20.625, 30.375], lat: [-63.89, -59.26]}
+    SO_TROP: {lon: [20.625, 30.375], lat: [-23.33, -14.11]}
+    N_JET: {lon: [0.625, 10.375], lat: [46.91, 53.16]}
+  # day lists, python range semantics (start, stop exclusive, step)
+  test_days: {start: 3600, stop: 4320, step: 1}
+  repro_days: {start: 3630, stop: 4316, step: 5}   # the 138 days of the planning numbers (check 5, 6)
+  input_path_days: [0, 2000, 4319]                  # check 4
+  keras_check_days: {start: 3610, count: 20, step: 35}   # check 8 (20 test days)
+
+acceptance:
+  A1: {r2_min: 0.70, bands: [all, abs_lat_ge_20], r2_min_lt20_exclusive: 0.0}
+  A2: {abs_bias_max: {all: 0.10, abs_lat_ge_20: 0.20, abs_lat_lt_20: 0.20}}
+  A3: {ratio_min: 0.5, ratio_max: 2.0, bands: [all, abs_lat_ge_20, abs_lat_lt_20]}
+  A4: {low10_max: 0.05}
+  A5: {r2_margin_over_Db_min_exclusive: 0.10}
+  A6: {max_abs_log_eke_diff: 5.0e-5}
+
+checks:                     # section 7
+  stats_std_rel_tol: 0.02
+  stats_abs_mean_max: 0.002
+  clip_fraction:            # section 4, |lat| bands [min, max); tolerance absolute
+    tol: 0.02
+    bands:
+      - {min: 0.0, max: 5.0, expect: 0.70}
+      - {min: 5.0, max: 10.0, expect: 0.088}
+      - {min: 10.0, max: 20.0, expect: 0.0003}
+      - {min: 20.0, max: 91.0, expect: 0.003}
+  grid_f_rel_tol: 1.0e-9    # check 2: grid_coriolis vs ff_t on wet cells outside row 99
+  D_a:                      # check 5: base weights, base statistics, repro_days; abs tol 1e-3, ratios rel 1e-3
+    abs_tol: 1.0e-3
+    rel_tol: 1.0e-3
+    all: {r2: -4.733, bias: -3.493, corr_log: 0.461, low10: 0.801, mean_ratio: 2.249, mean_ratio_area: 5.045}
+    abs_lat_ge_20: {r2: -5.533, bias: -4.103, mean_ratio: 0.0141}
+    abs_lat_lt_20: {r2: -4.148, bias: -1.171, mean_ratio: 49.98}
+  D_b:                      # check 6: base weights, 1 deg statistics, repro_days; tol 0.02
+    tol: 0.02
+    all: {r2: 0.254, bias: 0.430}
+    abs_lat_ge_20: {r2: 0.578, bias: 0.260}
+  D_c_r2_range: [0.83, 0.86]  # check 7, test days
+  keras_vs_jax_max_abs_log_eke: 5.0e-5   # check 8, wet cells
+  val_loss_rel_tol: 1.0e-3  # check 11: JAX masked MSE on validation days vs best Keras val_loss
+
+# ---- section 8: outputs ----
+out_dir: /work/scratch-pw4/twilder/dino_1deg/unet_finetune     # prepared data, D-b npz, logs, history, metrics.json, progress.md
+product_dir: ~/legoESM/results/eke_unet                        # model_<run_id>_ft1deg.{keras,npz}, _metrics.json
+files:
+  prepared: finetune_data_1deg.npz
+  base_1deg_stats_npz: base_1degstats.npz        # D-b: the base npz with vor_norm replaced by the vor_norm above
+  keras_base_reference: keras_base_on_X.npz      # check 8: Keras base model on stored X, written by the training script
+  pred_test_keras: pred_test_keras.npy           # (720, 199, 52) log EKE of the fine-tuned Keras model on the test days
